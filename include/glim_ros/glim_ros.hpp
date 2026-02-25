@@ -13,6 +13,11 @@
 #endif
 
 namespace glim {
+class AsyncDynamicObjectRejectionCPU;
+}
+
+
+namespace glim {
 class TimeKeeper;
 class CloudPreprocessor;
 class AsyncOdometryEstimation;
@@ -44,11 +49,15 @@ public:
 private:
   std::unique_ptr<glim::TimeKeeper> time_keeper;
   std::unique_ptr<glim::CloudPreprocessor> preprocessor;
-
+  
+  std::shared_ptr<glim::AsyncDynamicObjectRejectionCPU> dynamic_object_rejection;
   std::shared_ptr<glim::AsyncOdometryEstimation> odometry_estimation;
   std::unique_ptr<glim::AsyncSubMapping> sub_mapping;
   std::unique_ptr<glim::AsyncGlobalMapping> global_mapping;
-
+  
+  // Previous estimation frame for dynamic object rejection
+  glim::EstimationFrame::ConstPtr prev_estimation_frame;
+  
   bool keep_raw_points;
   double imu_time_offset;
   double points_time_offset;

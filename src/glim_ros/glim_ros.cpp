@@ -34,6 +34,9 @@
 #include <glim/odometry/async_odometry_estimation.hpp>
 #include <glim/mapping/async_sub_mapping.hpp>
 #include <glim/mapping/async_global_mapping.hpp>
+#ifdef GLIM_USE_DYNAMIC_REJECTION
+#include <glim/dynamic_rejection/async_dynamic_object_rejection.hpp>
+#endif
 #include <glim_ros/ros_compatibility.hpp>
 #include <glim_ros/ros_qos.hpp>
 
@@ -96,6 +99,11 @@ GlimROS::GlimROS(const rclcpp::NodeOptions& options) : Node("glim_ros", options)
   // Preprocessing
   time_keeper.reset(new glim::TimeKeeper);
   preprocessor.reset(new glim::CloudPreprocessor);
+
+#ifdef GLIM_USE_DYNAMIC_REJECTION
+  // Dynamic object rejection
+  dynamic_object_rejection.reset(new glim::AsyncDynamicObjectRejectionCPU(std::make_shared<glim::DynamicObjectRejectionCPU>()));
+#endif
 
   // Odometry estimation
   glim::Config config_odometry(glim::GlobalConfig::get_config_path("config_odometry"));
@@ -304,7 +312,24 @@ size_t GlimROS::points_callback(const sensor_msgs::msg::PointCloud2::ConstShared
     preprocessed->raw_points = raw_points;
   }
 
-  odometry_estimation->insert_frame(preprocessed);
+#ifdef GLIM_USE_DYNAMIC_REJECTION
+  // Apply dynamic object rejection if we have a previous estimation frame
+  glim::PreprocessedFrame::Ptr frame_for_odometry = preprocessed;
+  if (prev_estimation_frame && dynamic_object_rejection) {
+    dynamic_object_rejection->insert_frame(preprocessed, prev_estimation_frame);
+    auto processed_frames = dynamic_object_rejection->get_results();
+    if (!processed_frames.empty()) {
+      frame_for_odometry = processed_frames.back();  // Use the most recent processed frame
+    }
+  }
+  else {
+    frame_for_odometry = preprocessed;
+  }
+#else
+  glim::PreprocessedFrame::Ptr frame_for_odometry = preprocessed;
+#endif
+
+  odometry_estimation->insert_frame(frame_for_odometry);
 
   const size_t workload = odometry_estimation->workload();
   spdlog::debug("workload={}", workload);
@@ -333,6 +358,11 @@ void GlimROS::timer_callback() {
   std::vector<glim::EstimationFrame::ConstPtr> marginalized_frames;
   odometry_estimation->get_results(estimation_frames, marginalized_frames);
 
+  // Save the last estimation frame for dynamic object rejection
+  if (!estimation_frames.empty()) {
+    prev_estimation_frame = estimation_frames.back();
+  }
+
   if (sub_mapping) {
     for (const auto& frame : marginalized_frames) {
       sub_mapping->insert_frame(frame);
@@ -355,6 +385,12 @@ void GlimROS::wait(bool auto_quit) {
     std::vector<glim::EstimationFrame::ConstPtr> estimation_results;
     std::vector<glim::EstimationFrame::ConstPtr> marginalized_frames;
     odometry_estimation->get_results(estimation_results, marginalized_frames);
+    
+    // Save the last estimation frame for dynamic object rejection
+    if (!estimation_results.empty()) {
+      prev_estimation_frame = estimation_results.back();
+    }
+    
     for (const auto& marginalized_frame : marginalized_frames) {
       sub_mapping->insert_frame(marginalized_frame);
     }
