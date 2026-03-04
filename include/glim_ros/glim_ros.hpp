@@ -12,10 +12,7 @@
 #include <sensor_msgs/msg/image.hpp>
 #endif
 
-namespace glim {
-class AsyncDynamicObjectRejectionCPU;
-}
-
+#include <glim/odometry/estimation_frame.hpp>
 
 namespace glim {
 class TimeKeeper;
@@ -23,7 +20,7 @@ class CloudPreprocessor;
 class AsyncOdometryEstimation;
 class AsyncSubMapping;
 class AsyncGlobalMapping;
-
+class AsyncDynamicObjectRejectionCPU;
 class ExtensionModule;
 class GenericTopicSubscription;
 

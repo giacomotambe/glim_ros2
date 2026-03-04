@@ -7,12 +7,13 @@
 #include <glim/util/extension_module_ros2.hpp>
 
 int main(int argc, char** argv) {
+  printf("GlimROS node created\n");
   rclcpp::init(argc, argv);
   rclcpp::executors::SingleThreadedExecutor exec;
   rclcpp::NodeOptions options;
 
   auto glim = std::make_shared<glim::GlimROS>(options);
-
+  
   rclcpp::spin(glim);
   rclcpp::shutdown();
 
