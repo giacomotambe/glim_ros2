@@ -20,7 +20,7 @@ class CloudPreprocessor;
 class AsyncOdometryEstimation;
 class AsyncSubMapping;
 class AsyncGlobalMapping;
-class AsyncDynamicObjectRejectionCPU;
+class AsyncDynamicObjectRejection;
 class ExtensionModule;
 class GenericTopicSubscription;
 
@@ -47,7 +47,7 @@ private:
   std::unique_ptr<glim::TimeKeeper> time_keeper;
   std::unique_ptr<glim::CloudPreprocessor> preprocessor;
   
-  std::shared_ptr<glim::AsyncDynamicObjectRejectionCPU> dynamic_object_rejection;
+  std::shared_ptr<glim::AsyncDynamicObjectRejection> dynamic_object_rejection;
   std::shared_ptr<glim::AsyncOdometryEstimation> odometry_estimation;
   std::unique_ptr<glim::AsyncSubMapping> sub_mapping;
   std::unique_ptr<glim::AsyncGlobalMapping> global_mapping;

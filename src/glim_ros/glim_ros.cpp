@@ -34,7 +34,7 @@
 #include <glim/odometry/async_odometry_estimation.hpp>
 #include <glim/mapping/async_sub_mapping.hpp>
 #include <glim/mapping/async_global_mapping.hpp>
-#ifdef BUILD_WITH_DYNAMIC_REJECTION
+#ifdef GLIM_USE_DYNAMIC_REJECTION
 #include <glim/dynamic_rejection/async_dynamic_object_rejection.hpp>
 #endif
 #include <glim_ros/ros_compatibility.hpp>
@@ -73,7 +73,7 @@ GlimROS::GlimROS(const rclcpp::NodeOptions& options) : Node("glim_ros", options)
   this->declare_parameter<std::string>("config_path", "config");
   this->get_parameter<std::string>("config_path", config_path);
 
-  if (config_path[0] != '/') {
+  if (config_path.empty() || config_path[0] != '/') {
     // config_path is relative to the glim directory
     config_path = ament_index_cpp::get_package_share_directory("glim") + "/" + config_path;
   }
@@ -99,11 +99,10 @@ GlimROS::GlimROS(const rclcpp::NodeOptions& options) : Node("glim_ros", options)
   // Preprocessing
   time_keeper.reset(new glim::TimeKeeper);
   preprocessor.reset(new glim::CloudPreprocessor);
-  spdlog::info("prova prova prova");
-#ifdef BUILD_WITH_DYNAMIC_REJECTION
+#ifdef GLIM_USE_DYNAMIC_REJECTION
   // Dynamic object rejection
-  spdlog::info("dynamic object rejection is enabled");
-  dynamic_object_rejection.reset(new glim::AsyncDynamicObjectRejectionCPU(std::make_shared<glim::DynamicObjectRejectionCPU>()));
+  spdlog::info("enable dynamic object rejection");
+  dynamic_object_rejection.reset(new glim::AsyncDynamicObjectRejection(std::make_shared<glim::DynamicObjectRejectionCPU>()));   
 #endif
 
   // Odometry estimation
@@ -228,6 +227,7 @@ const std::vector<std::shared_ptr<GenericTopicSubscription>>& GlimROS::extension
 }
 
 void GlimROS::imu_callback(const sensor_msgs::msg::Imu::SharedPtr msg) {
+  spdlog::debug("imu callback");
   spdlog::trace("IMU: {}.{}", msg->header.stamp.sec, msg->header.stamp.nanosec);
   if (!GlobalConfig::instance()->has_param("meta", "imu_frame_id")) {
     spdlog::debug("auto-detecting IMU frame ID: {}", msg->header.frame_id);
@@ -288,6 +288,7 @@ void GlimROS::image_callback(const sensor_msgs::msg::Image::ConstSharedPtr msg) 
 #endif
 
 size_t GlimROS::points_callback(const sensor_msgs::msg::PointCloud2::ConstSharedPtr msg) {
+  spdlog::debug("points callback");
   spdlog::trace("points: {}.{}", msg->header.stamp.sec, msg->header.stamp.nanosec);
   if (!GlobalConfig::instance()->has_param("meta", "lidar_frame_id")) {
     spdlog::debug("auto-detecting LiDAR frame ID: {}", msg->header.frame_id);
@@ -313,8 +314,9 @@ size_t GlimROS::points_callback(const sensor_msgs::msg::PointCloud2::ConstShared
     preprocessed->raw_points = raw_points;
   }
 
-#ifdef BUILD_WITH_DYNAMIC_REJECTION
+#ifdef GLIM_USE_DYNAMIC_REJECTION
   // Apply dynamic object rejection if we have a previous estimation frame
+  
   glim::PreprocessedFrame::Ptr frame_for_odometry = preprocessed;
   if (prev_estimation_frame && dynamic_object_rejection) {
     dynamic_object_rejection->insert_frame(preprocessed, prev_estimation_frame);
@@ -323,13 +325,10 @@ size_t GlimROS::points_callback(const sensor_msgs::msg::PointCloud2::ConstShared
       frame_for_odometry = processed_frames.back();  // Use the most recent processed frame
     }
   }
-  else {
-    frame_for_odometry = preprocessed;
-  }
 #else
   glim::PreprocessedFrame::Ptr frame_for_odometry = preprocessed;
 #endif
-
+  spdlog::info("inserting frame to odometry estimation (points={}, dynamic_rejection={})", frame_for_odometry->points.size(), frame_for_odometry != preprocessed);
   odometry_estimation->insert_frame(frame_for_odometry);
 
   const size_t workload = odometry_estimation->workload();
