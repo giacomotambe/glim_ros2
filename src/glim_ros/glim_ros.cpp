@@ -195,6 +195,8 @@ GlimROS::GlimROS(const rclcpp::NodeOptions& options) : Node("glim_ros", options)
 
   qos = get_qos_settings(config_ros, "glim_ros", "points_qos");
   points_sub = this->create_subscription<sensor_msgs::msg::PointCloud2>(points_topic, qos, std::bind(&GlimROS::points_callback, this, _1));
+  filtered_points_pub = this->create_publisher<sensor_msgs::msg::PointCloud2>("~/filtered_points", 10);
+  dynamic_points_pub = this->create_publisher<sensor_msgs::msg::PointCloud2>("~/dynamic_points", 10);
 #ifdef BUILD_WITH_CV_BRIDGE
   qos = get_qos_settings(config_ros, "glim_ros", "image_qos");
   image_sub = image_transport::create_subscription(this, image_topic, std::bind(&GlimROS::image_callback, this, _1), "raw", qos.get_rmw_qos_profile());
@@ -315,19 +317,103 @@ size_t GlimROS::points_callback(const sensor_msgs::msg::PointCloud2::ConstShared
   }
 
 #ifdef GLIM_USE_DYNAMIC_REJECTION
-  // Apply dynamic object rejection if we have a previous estimation frame
+  // Apply dynamic object rejection
   
   glim::PreprocessedFrame::Ptr frame_for_odometry = preprocessed;
-  if (prev_estimation_frame && dynamic_object_rejection) {
-    dynamic_object_rejection->insert_frame(preprocessed, prev_estimation_frame);
+  if (dynamic_object_rejection) {
+    dynamic_object_rejection->insert_frame(preprocessed);
     auto processed_frames = dynamic_object_rejection->get_results();
     if (!processed_frames.empty()) {
       frame_for_odometry = processed_frames.back();  // Use the most recent processed frame
+    }
+
+    // Publish dynamic-only points
+    if (dynamic_points_pub->get_subscription_count() > 0) {
+      auto dyn_frames = dynamic_object_rejection->get_dynamic_results();
+      for (const auto& dyn_frame : dyn_frames) {
+        if (!dyn_frame || dyn_frame->points.empty()) continue;
+        auto dyn_msg = std::make_unique<sensor_msgs::msg::PointCloud2>();
+        dyn_msg->header = msg->header;
+        dyn_msg->height = 1;
+        dyn_msg->width = dyn_frame->points.size();
+        dyn_msg->fields.resize(3);
+        for (int i = 0; i < 3; i++) {
+          dyn_msg->fields[i].name = std::vector<std::string>{"x", "y", "z"}[i];
+          dyn_msg->fields[i].offset = sizeof(float) * i;
+          dyn_msg->fields[i].datatype = sensor_msgs::msg::PointField::FLOAT32;
+          dyn_msg->fields[i].count = 1;
+        }
+        int dyn_step = sizeof(float) * 3;
+        if (!dyn_frame->intensities.empty()) {
+          sensor_msgs::msg::PointField ifield;
+          ifield.name = "intensity";
+          ifield.offset = dyn_step;
+          ifield.datatype = sensor_msgs::msg::PointField::FLOAT32;
+          ifield.count = 1;
+          dyn_msg->fields.push_back(ifield);
+          dyn_step += sizeof(float);
+        }
+        dyn_msg->is_bigendian = false;
+        dyn_msg->point_step = dyn_step;
+        dyn_msg->row_step = dyn_step * dyn_msg->width;
+        dyn_msg->data.resize(dyn_msg->row_step);
+        dyn_msg->is_dense = true;
+        for (size_t i = 0; i < dyn_frame->points.size(); i++) {
+          float* ptr = reinterpret_cast<float*>(dyn_msg->data.data() + dyn_step * i);
+          ptr[0] = static_cast<float>(dyn_frame->points[i].x());
+          ptr[1] = static_cast<float>(dyn_frame->points[i].y());
+          ptr[2] = static_cast<float>(dyn_frame->points[i].z());
+          if (!dyn_frame->intensities.empty()) {
+            ptr[3] = static_cast<float>(dyn_frame->intensities[i]);
+          }
+        }
+        dynamic_points_pub->publish(std::move(dyn_msg));
+      }
     }
   }
 #else
   glim::PreprocessedFrame::Ptr frame_for_odometry = preprocessed;
 #endif
+  // Publish filtered point cloud after dynamic rejection
+  if (frame_for_odometry != preprocessed && filtered_points_pub->get_subscription_count() > 0) {
+    auto filtered_msg = std::make_unique<sensor_msgs::msg::PointCloud2>();
+    filtered_msg->header = msg->header;
+    filtered_msg->height = 1;
+    filtered_msg->width = frame_for_odometry->points.size();
+    filtered_msg->fields.resize(3);
+    for (int i = 0; i < 3; i++) {
+      filtered_msg->fields[i].name = std::vector<std::string>{"x", "y", "z"}[i];
+      filtered_msg->fields[i].offset = sizeof(float) * i;
+      filtered_msg->fields[i].datatype = sensor_msgs::msg::PointField::FLOAT32;
+      filtered_msg->fields[i].count = 1;
+    }
+    int point_step = sizeof(float) * 3;
+    if (!frame_for_odometry->intensities.empty()) {
+      sensor_msgs::msg::PointField intensity_field_desc;
+      intensity_field_desc.name = "intensity";
+      intensity_field_desc.offset = point_step;
+      intensity_field_desc.datatype = sensor_msgs::msg::PointField::FLOAT32;
+      intensity_field_desc.count = 1;
+      filtered_msg->fields.push_back(intensity_field_desc);
+      point_step += sizeof(float);
+    }
+    filtered_msg->is_bigendian = false;
+    filtered_msg->point_step = point_step;
+    filtered_msg->row_step = point_step * filtered_msg->width;
+    filtered_msg->data.resize(filtered_msg->row_step);
+    filtered_msg->is_dense = true;
+    for (size_t i = 0; i < frame_for_odometry->points.size(); i++) {
+      float* ptr = reinterpret_cast<float*>(filtered_msg->data.data() + point_step * i);
+      ptr[0] = static_cast<float>(frame_for_odometry->points[i].x());
+      ptr[1] = static_cast<float>(frame_for_odometry->points[i].y());
+      ptr[2] = static_cast<float>(frame_for_odometry->points[i].z());
+      if (!frame_for_odometry->intensities.empty()) {
+        ptr[3] = static_cast<float>(frame_for_odometry->intensities[i]);
+      }
+    }
+    filtered_points_pub->publish(std::move(filtered_msg));
+  }
+
   spdlog::info("inserting frame to odometry estimation (points={}, dynamic_rejection={})", frame_for_odometry->points.size(), frame_for_odometry != preprocessed);
   odometry_estimation->insert_frame(frame_for_odometry);
 
@@ -358,9 +444,9 @@ void GlimROS::timer_callback() {
   std::vector<glim::EstimationFrame::ConstPtr> marginalized_frames;
   odometry_estimation->get_results(estimation_frames, marginalized_frames);
 
-  // Save the last estimation frame for dynamic object rejection
+  // Save the last estimation frame
   if (!estimation_frames.empty()) {
-    prev_estimation_frame = estimation_frames.back();
+    // estimation_frames available for other uses
   }
 
   if (sub_mapping) {
@@ -386,9 +472,9 @@ void GlimROS::wait(bool auto_quit) {
     std::vector<glim::EstimationFrame::ConstPtr> marginalized_frames;
     odometry_estimation->get_results(estimation_results, marginalized_frames);
     
-    // Save the last estimation frame for dynamic object rejection
+    // Save the last estimation frame
     if (!estimation_results.empty()) {
-      prev_estimation_frame = estimation_results.back();
+      // estimation_results available for other uses
     }
     
     for (const auto& marginalized_frame : marginalized_frames) {

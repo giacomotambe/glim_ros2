@@ -52,9 +52,6 @@ private:
   std::unique_ptr<glim::AsyncSubMapping> sub_mapping;
   std::unique_ptr<glim::AsyncGlobalMapping> global_mapping;
   
-  // Previous estimation frame for dynamic object rejection
-  glim::EstimationFrame::ConstPtr prev_estimation_frame;
-  
   bool keep_raw_points;
   double imu_time_offset;
   double points_time_offset;
@@ -71,6 +68,8 @@ private:
   rclcpp::TimerBase::SharedPtr timer;
   rclcpp::Subscription<sensor_msgs::msg::Imu>::SharedPtr imu_sub;
   rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr points_sub;
+  rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr filtered_points_pub;
+  rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr dynamic_points_pub;
 #ifdef BUILD_WITH_CV_BRIDGE
   image_transport::Subscriber image_sub;
 #endif
