@@ -2,17 +2,21 @@
 
 #include <any>
 #include <deque>
+#include <mutex>
 #include <memory>
 #include <rclcpp/rclcpp.hpp>
 
 #include <sensor_msgs/msg/imu.hpp>
 #include <sensor_msgs/msg/point_cloud2.hpp>
+#include <geometry_msgs/msg/pose_stamped.hpp>
 #ifdef BUILD_WITH_CV_BRIDGE
 #include <image_transport/image_transport.hpp>
 #include <sensor_msgs/msg/image.hpp>
 #endif
 
 #include <glim/odometry/estimation_frame.hpp>
+
+
 
 namespace glim {
 class TimeKeeper;
@@ -21,6 +25,8 @@ class AsyncOdometryEstimation;
 class AsyncSubMapping;
 class AsyncGlobalMapping;
 class AsyncDynamicObjectRejection;
+class DynamicObjectRejectionCPU;
+class PoseKalmanFilter;
 class ExtensionModule;
 class GenericTopicSubscription;
 
@@ -48,6 +54,11 @@ private:
   std::unique_ptr<glim::CloudPreprocessor> preprocessor;
   
   std::shared_ptr<glim::AsyncDynamicObjectRejection> dynamic_object_rejection;
+  std::shared_ptr<glim::PoseKalmanFilter> pose_kalman_filter;
+  double last_imu_stamp_;
+  struct KfImuData { Eigen::Vector3d acc; Eigen::Vector3d gyro; double dt; };
+  std::mutex kf_imu_mutex_;
+  std::deque<KfImuData> kf_imu_queue_;
   std::shared_ptr<glim::AsyncOdometryEstimation> odometry_estimation;
   std::unique_ptr<glim::AsyncSubMapping> sub_mapping;
   std::unique_ptr<glim::AsyncGlobalMapping> global_mapping;
@@ -70,6 +81,8 @@ private:
   rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr points_sub;
   rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr filtered_points_pub;
   rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr dynamic_points_pub;
+  rclcpp::Publisher<geometry_msgs::msg::PoseStamped>::SharedPtr filtered_pose_pub;
+
 #ifdef BUILD_WITH_CV_BRIDGE
   image_transport::Subscriber image_sub;
 #endif

@@ -34,6 +34,7 @@
 #include <glim/odometry/async_odometry_estimation.hpp>
 #include <glim/mapping/async_sub_mapping.hpp>
 #include <glim/mapping/async_global_mapping.hpp>
+#include <glim/dynamic_rejection/transformation_kalman_filter.hpp>
 #ifdef GLIM_USE_DYNAMIC_REJECTION
 #include <glim/dynamic_rejection/async_dynamic_object_rejection.hpp>
 #endif
@@ -99,10 +100,15 @@ GlimROS::GlimROS(const rclcpp::NodeOptions& options) : Node("glim_ros", options)
   // Preprocessing
   time_keeper.reset(new glim::TimeKeeper);
   preprocessor.reset(new glim::CloudPreprocessor);
+  // Pose Kalman filter (shared with dynamic object rejection)
+  pose_kalman_filter = std::make_shared<glim::PoseKalmanFilter>();
+  last_imu_stamp_ = -1.0;
+
 #ifdef GLIM_USE_DYNAMIC_REJECTION
-  // Dynamic object rejection
+  // Dynamic object rejection (async)
   spdlog::info("enable dynamic object rejection");
-  dynamic_object_rejection.reset(new glim::AsyncDynamicObjectRejection(std::make_shared<glim::DynamicObjectRejectionCPU>()));   
+  auto dyn_rejection = std::make_shared<glim::DynamicObjectRejectionCPU>(glim::DynamicObjectRejectionParamsCPU(), pose_kalman_filter);
+  dynamic_object_rejection = std::make_shared<glim::AsyncDynamicObjectRejection>(dyn_rejection);
 #endif
 
   // Odometry estimation
@@ -197,6 +203,7 @@ GlimROS::GlimROS(const rclcpp::NodeOptions& options) : Node("glim_ros", options)
   points_sub = this->create_subscription<sensor_msgs::msg::PointCloud2>(points_topic, qos, std::bind(&GlimROS::points_callback, this, _1));
   filtered_points_pub = this->create_publisher<sensor_msgs::msg::PointCloud2>("~/filtered_points", 10);
   dynamic_points_pub = this->create_publisher<sensor_msgs::msg::PointCloud2>("~/dynamic_points", 10);
+  filtered_pose_pub = this->create_publisher<geometry_msgs::msg::PoseStamped>("~/filtered_pose", 10);
 #ifdef BUILD_WITH_CV_BRIDGE
   qos = get_qos_settings(config_ros, "glim_ros", "image_qos");
   image_sub = image_transport::create_subscription(this, image_topic, std::bind(&GlimROS::image_callback, this, _1), "raw", qos.get_rmw_qos_profile());
@@ -260,6 +267,16 @@ void GlimROS::imu_callback(const sensor_msgs::msg::Imu::SharedPtr msg) {
   }
 
   odometry_estimation->insert_imu(imu_stamp, linear_acc, angular_vel);
+  if (pose_kalman_filter) {
+    if (last_imu_stamp_ > 0.0) {
+      const double dt = imu_stamp - last_imu_stamp_;
+      if (dt > 0.0 && dt < 1.0) {
+        std::lock_guard<std::mutex> lock(kf_imu_mutex_);
+        kf_imu_queue_.push_back({linear_acc, angular_vel, dt});
+      }
+    }
+    last_imu_stamp_ = imu_stamp;
+  }
   if (sub_mapping) {
     sub_mapping->insert_imu(imu_stamp, linear_acc, angular_vel);
   }
@@ -317,14 +334,55 @@ size_t GlimROS::points_callback(const sensor_msgs::msg::PointCloud2::ConstShared
   }
 
 #ifdef GLIM_USE_DYNAMIC_REJECTION
-  // Apply dynamic object rejection
-  
-  glim::PreprocessedFrame::Ptr frame_for_odometry = preprocessed;
+  // Apply dynamic object rejection (async)
   if (dynamic_object_rejection) {
+    // Enqueue new frame for background processing
     dynamic_object_rejection->insert_frame(preprocessed);
+
+    // Poll completed results and feed each to odometry (no raw fallback to avoid duplicates)
     auto processed_frames = dynamic_object_rejection->get_results();
-    if (!processed_frames.empty()) {
-      frame_for_odometry = processed_frames.back();  // Use the most recent processed frame
+    for (const auto& filtered_frame : processed_frames) {
+      // Publish filtered point cloud
+      if (filtered_points_pub->get_subscription_count() > 0) {
+        auto filtered_msg = std::make_unique<sensor_msgs::msg::PointCloud2>();
+        filtered_msg->header = msg->header;
+        filtered_msg->header.stamp = rclcpp::Time(static_cast<int64_t>(filtered_frame->stamp * 1e9));
+        filtered_msg->height = 1;
+        filtered_msg->width = filtered_frame->points.size();
+        filtered_msg->fields.resize(3);
+        for (int i = 0; i < 3; i++) {
+          filtered_msg->fields[i].name = std::vector<std::string>{"x", "y", "z"}[i];
+          filtered_msg->fields[i].offset = sizeof(float) * i;
+          filtered_msg->fields[i].datatype = sensor_msgs::msg::PointField::FLOAT32;
+          filtered_msg->fields[i].count = 1;
+        }
+        int point_step = sizeof(float) * 3;
+        if (!filtered_frame->intensities.empty()) {
+          sensor_msgs::msg::PointField ifield;
+          ifield.name = "intensity";
+          ifield.offset = point_step;
+          ifield.datatype = sensor_msgs::msg::PointField::FLOAT32;
+          ifield.count = 1;
+          filtered_msg->fields.push_back(ifield);
+          point_step += sizeof(float);
+        }
+        filtered_msg->is_bigendian = false;
+        filtered_msg->point_step = point_step;
+        filtered_msg->row_step = point_step * filtered_msg->width;
+        filtered_msg->data.resize(filtered_msg->row_step);
+        filtered_msg->is_dense = true;
+        for (size_t i = 0; i < filtered_frame->points.size(); i++) {
+          float* ptr = reinterpret_cast<float*>(filtered_msg->data.data() + point_step * i);
+          ptr[0] = static_cast<float>(filtered_frame->points[i].x());
+          ptr[1] = static_cast<float>(filtered_frame->points[i].y());
+          ptr[2] = static_cast<float>(filtered_frame->points[i].z());
+          if (!filtered_frame->intensities.empty()) {
+            ptr[3] = static_cast<float>(filtered_frame->intensities[i]);
+          }
+        }
+        filtered_points_pub->publish(std::move(filtered_msg));
+      }
+      odometry_estimation->insert_frame(filtered_frame);
     }
 
     // Publish dynamic-only points
@@ -334,6 +392,7 @@ size_t GlimROS::points_callback(const sensor_msgs::msg::PointCloud2::ConstShared
         if (!dyn_frame || dyn_frame->points.empty()) continue;
         auto dyn_msg = std::make_unique<sensor_msgs::msg::PointCloud2>();
         dyn_msg->header = msg->header;
+        dyn_msg->header.stamp = rclcpp::Time(static_cast<int64_t>(dyn_frame->stamp * 1e9));
         dyn_msg->height = 1;
         dyn_msg->width = dyn_frame->points.size();
         dyn_msg->fields.resize(3);
@@ -370,52 +429,12 @@ size_t GlimROS::points_callback(const sensor_msgs::msg::PointCloud2::ConstShared
         dynamic_points_pub->publish(std::move(dyn_msg));
       }
     }
+  } else {
+    odometry_estimation->insert_frame(preprocessed);
   }
 #else
-  glim::PreprocessedFrame::Ptr frame_for_odometry = preprocessed;
+  odometry_estimation->insert_frame(preprocessed);
 #endif
-  // Publish filtered point cloud after dynamic rejection
-  if (frame_for_odometry != preprocessed && filtered_points_pub->get_subscription_count() > 0) {
-    auto filtered_msg = std::make_unique<sensor_msgs::msg::PointCloud2>();
-    filtered_msg->header = msg->header;
-    filtered_msg->height = 1;
-    filtered_msg->width = frame_for_odometry->points.size();
-    filtered_msg->fields.resize(3);
-    for (int i = 0; i < 3; i++) {
-      filtered_msg->fields[i].name = std::vector<std::string>{"x", "y", "z"}[i];
-      filtered_msg->fields[i].offset = sizeof(float) * i;
-      filtered_msg->fields[i].datatype = sensor_msgs::msg::PointField::FLOAT32;
-      filtered_msg->fields[i].count = 1;
-    }
-    int point_step = sizeof(float) * 3;
-    if (!frame_for_odometry->intensities.empty()) {
-      sensor_msgs::msg::PointField intensity_field_desc;
-      intensity_field_desc.name = "intensity";
-      intensity_field_desc.offset = point_step;
-      intensity_field_desc.datatype = sensor_msgs::msg::PointField::FLOAT32;
-      intensity_field_desc.count = 1;
-      filtered_msg->fields.push_back(intensity_field_desc);
-      point_step += sizeof(float);
-    }
-    filtered_msg->is_bigendian = false;
-    filtered_msg->point_step = point_step;
-    filtered_msg->row_step = point_step * filtered_msg->width;
-    filtered_msg->data.resize(filtered_msg->row_step);
-    filtered_msg->is_dense = true;
-    for (size_t i = 0; i < frame_for_odometry->points.size(); i++) {
-      float* ptr = reinterpret_cast<float*>(filtered_msg->data.data() + point_step * i);
-      ptr[0] = static_cast<float>(frame_for_odometry->points[i].x());
-      ptr[1] = static_cast<float>(frame_for_odometry->points[i].y());
-      ptr[2] = static_cast<float>(frame_for_odometry->points[i].z());
-      if (!frame_for_odometry->intensities.empty()) {
-        ptr[3] = static_cast<float>(frame_for_odometry->intensities[i]);
-      }
-    }
-    filtered_points_pub->publish(std::move(filtered_msg));
-  }
-
-  spdlog::info("inserting frame to odometry estimation (points={}, dynamic_rejection={})", frame_for_odometry->points.size(), frame_for_odometry != preprocessed);
-  odometry_estimation->insert_frame(frame_for_odometry);
 
   const size_t workload = odometry_estimation->workload();
   spdlog::debug("workload={}", workload);
@@ -446,7 +465,49 @@ void GlimROS::timer_callback() {
 
   // Save the last estimation frame
   if (!estimation_frames.empty()) {
-    // estimation_frames available for other uses
+    if (pose_kalman_filter) {
+      // Drain IMU queue and run all pending predictions on this thread
+      size_t n_imu = 0;
+      {
+        std::lock_guard<std::mutex> lock(kf_imu_mutex_);
+        n_imu = kf_imu_queue_.size();
+        for (const auto& imu : kf_imu_queue_) {
+          glim::ImuMeasurement m;
+          m.acc = imu.acc;
+          m.gyro = imu.gyro;
+          m.dt = imu.dt;
+          pose_kalman_filter->predict(m);
+        }
+        kf_imu_queue_.clear();
+      }
+
+      spdlog::debug("[KF] predicted {} IMU samples, calling update", n_imu);
+      const auto& latest = estimation_frames.back();
+      if (!latest) {
+        spdlog::warn("[KF] latest estimation frame is null, skipping update");
+      } else {
+        spdlog::debug("[KF] latest frame stamp={:.6f}", latest->stamp);
+        const Eigen::Isometry3d T_world_imu_filtered = pose_kalman_filter->update(latest->T_world_imu);
+        spdlog::debug("[KF] update done, publishing");
+
+        auto pose_msg = std::make_unique<geometry_msgs::msg::PoseStamped>();
+        pose_msg->header.stamp = rclcpp::Time(static_cast<int64_t>(latest->stamp * 1e9));
+        pose_msg->header.frame_id = "map";
+
+        const Eigen::Vector3d p = T_world_imu_filtered.translation();
+        const Eigen::Quaterniond q(T_world_imu_filtered.rotation());
+        pose_msg->pose.position.x = p.x();
+        pose_msg->pose.position.y = p.y();
+        pose_msg->pose.position.z = p.z();
+        pose_msg->pose.orientation.w = q.w();
+        pose_msg->pose.orientation.x = q.x();
+        pose_msg->pose.orientation.y = q.y();
+        pose_msg->pose.orientation.z = q.z();
+
+        filtered_pose_pub->publish(std::move(pose_msg));
+        spdlog::info("[KF] published filtered pose");
+      }
+    }
   }
 
   if (sub_mapping) {
