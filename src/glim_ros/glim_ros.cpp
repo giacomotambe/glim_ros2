@@ -35,11 +35,16 @@
 #include <glim/mapping/async_sub_mapping.hpp>
 #include <glim/mapping/async_global_mapping.hpp>
 #include <glim/dynamic_rejection/transformation_kalman_filter.hpp>
-#ifdef GLIM_USE_DYNAMIC_REJECTION
+#ifdef GLIM_USE_DYNAMIC_REJECTION_VOXEL
 #include <glim/dynamic_rejection/async_dynamic_object_rejection.hpp>
+#endif
+#ifdef GLIM_USE_DYNAMIC_REJECTION_BBOX
+#include <glim/dynamic_rejection/dynamic_bounding_box_rejection.hpp>
+#include <glim/dynamic_rejection/bounding_box.hpp>
 #endif
 #include <glim_ros/ros_compatibility.hpp>
 #include <glim_ros/ros_qos.hpp>
+#include <glim_ros/pointcloud2_msg.hpp>
 
 namespace glim {
 
@@ -103,8 +108,12 @@ GlimROS::GlimROS(const rclcpp::NodeOptions& options) : Node("glim_ros", options)
   // Pose Kalman filter (shared with dynamic object rejection)
   pose_kalman_filter = std::make_shared<glim::PoseKalmanFilter>();
   last_imu_stamp_ = -1.0;
-
-#ifdef GLIM_USE_DYNAMIC_REJECTION
+#ifdef GLIM_USE_DYNAMIC_REJECTION_BBOX
+  // Dynamic object rejection (bbox-based)
+  spdlog::info("enable dynamic bounding box-based object rejection");
+  auto dyn_bbox_rejection = std::make_shared<glim::DynamicBBoxRejection>();
+#endif
+#ifdef GLIM_USE_DYNAMIC_REJECTION_VOXEL
   // Dynamic object rejection (async)
   spdlog::info("enable dynamic object rejection");
   auto dyn_rejection = std::make_shared<glim::DynamicObjectRejectionCPU>(glim::DynamicObjectRejectionParamsCPU(), pose_kalman_filter);
@@ -192,7 +201,7 @@ GlimROS::GlimROS(const rclcpp::NodeOptions& options) : Node("glim_ros", options)
   const std::string imu_topic = config_ros.param<std::string>("glim_ros", "imu_topic", "");
   const std::string points_topic = config_ros.param<std::string>("glim_ros", "points_topic", "");
   const std::string image_topic = config_ros.param<std::string>("glim_ros", "image_topic", "");
-
+  const std::string bbox_topic = config_ros.param<std::string>("glim_ros", "bbox_topic", "");
   // Subscribers
   rclcpp::SensorDataQoS default_imu_qos;
   default_imu_qos.get_rmw_qos_profile().depth = 1000;
@@ -201,8 +210,20 @@ GlimROS::GlimROS(const rclcpp::NodeOptions& options) : Node("glim_ros", options)
 
   qos = get_qos_settings(config_ros, "glim_ros", "points_qos");
   points_sub = this->create_subscription<sensor_msgs::msg::PointCloud2>(points_topic, qos, std::bind(&GlimROS::points_callback, this, _1));
-  filtered_points_pub = this->create_publisher<sensor_msgs::msg::PointCloud2>("~/filtered_points", 10);
-  dynamic_points_pub = this->create_publisher<sensor_msgs::msg::PointCloud2>("~/dynamic_points", 10);
+  
+#ifdef GLIM_USE_DYNAMIC_REJECTION_BBOX
+  auto bbox_qos = get_qos_settings(config_ros, "glim_ros", "bbox_qos");
+  bbox_sub = this->create_subscription<visualization_msgs::msg::MarkerArray>(bbox_topic, bbox_qos, std::bind(&GlimROS::bbox_callback, this, _1));
+#endif
+#ifdef GLIM_USE_DYNAMIC_REJECTION_VOXEL
+  // Publishers
+  filtered_points_voxel_pub = this->create_publisher<sensor_msgs::msg::PointCloud2>("~/filtered_points_voxel", 10);
+  dynamic_points_voxel_pub = this->create_publisher<sensor_msgs::msg::PointCloud2>("~/dynamic_points_voxel", 10);
+#endif
+#ifdef GLIM_USE_DYNAMIC_REJECTION_BBOX
+  filtered_points_bbox_pub = this->create_publisher<sensor_msgs::msg::PointCloud2>("~/filtered_points_bbox", 10);
+  dynamic_points_bbox_pub = this->create_publisher<sensor_msgs::msg::PointCloud2>("~/dynamic_points_bbox", 10);
+#endif
   filtered_pose_pub = this->create_publisher<geometry_msgs::msg::PoseStamped>("~/filtered_pose", 10);
 #ifdef BUILD_WITH_CV_BRIDGE
   qos = get_qos_settings(config_ros, "glim_ros", "image_qos");
@@ -234,6 +255,7 @@ GlimROS::~GlimROS() {
 const std::vector<std::shared_ptr<GenericTopicSubscription>>& GlimROS::extension_subscriptions() {
   return extension_subs;
 }
+
 
 void GlimROS::imu_callback(const sensor_msgs::msg::Imu::SharedPtr msg) {
   spdlog::debug("imu callback");
@@ -332,8 +354,25 @@ size_t GlimROS::points_callback(const sensor_msgs::msg::PointCloud2::ConstShared
     //       If you need to reduce the memory footprint, you can safely comment out the following line.
     preprocessed->raw_points = raw_points;
   }
-
-#ifdef GLIM_USE_DYNAMIC_REJECTION
+#ifdef GLIM_USE_DYNAMIC_REJECTION_BBOX
+  // Apply dynamic object rejection (bbox-based)
+  if (dyn_bbox_rejection) {
+    preprocessed = dyn_bbox_rejection->reject(preprocessed);
+    if (filtered_points_bbox_pub->get_subscription_count() > 0) {
+      auto filtered_msg = create_pointcloud2_msg(msg->header, preprocessed);
+      filtered_points_bbox_pub->publish(std::move(filtered_msg));
+    }
+    if (dynamic_points_bbox_pub->get_subscription_count() > 0) {
+      auto dyn_points = dyn_bbox_rejection->get_last_dynamic_frame();
+      if (dyn_points && !dyn_points->points.empty()) {
+        auto dyn_msg = create_pointcloud2_msg(msg->header, dyn_points);
+        dynamic_points_bbox_pub->publish(std::move(dyn_msg));
+      }
+    }
+    odometry_estimation->insert_frame(preprocessed);
+    
+  }  
+#elif defined(GLIM_USE_DYNAMIC_REJECTION_VOXEL)
   // Apply dynamic object rejection (async)
   if (dynamic_object_rejection) {
     // Enqueue new frame for background processing
@@ -343,90 +382,20 @@ size_t GlimROS::points_callback(const sensor_msgs::msg::PointCloud2::ConstShared
     auto processed_frames = dynamic_object_rejection->get_results();
     for (const auto& filtered_frame : processed_frames) {
       // Publish filtered point cloud
-      if (filtered_points_pub->get_subscription_count() > 0) {
-        auto filtered_msg = std::make_unique<sensor_msgs::msg::PointCloud2>();
-        filtered_msg->header = msg->header;
-        filtered_msg->header.stamp = rclcpp::Time(static_cast<int64_t>(filtered_frame->stamp * 1e9));
-        filtered_msg->height = 1;
-        filtered_msg->width = filtered_frame->points.size();
-        filtered_msg->fields.resize(3);
-        for (int i = 0; i < 3; i++) {
-          filtered_msg->fields[i].name = std::vector<std::string>{"x", "y", "z"}[i];
-          filtered_msg->fields[i].offset = sizeof(float) * i;
-          filtered_msg->fields[i].datatype = sensor_msgs::msg::PointField::FLOAT32;
-          filtered_msg->fields[i].count = 1;
-        }
-        int point_step = sizeof(float) * 3;
-        if (!filtered_frame->intensities.empty()) {
-          sensor_msgs::msg::PointField ifield;
-          ifield.name = "intensity";
-          ifield.offset = point_step;
-          ifield.datatype = sensor_msgs::msg::PointField::FLOAT32;
-          ifield.count = 1;
-          filtered_msg->fields.push_back(ifield);
-          point_step += sizeof(float);
-        }
-        filtered_msg->is_bigendian = false;
-        filtered_msg->point_step = point_step;
-        filtered_msg->row_step = point_step * filtered_msg->width;
-        filtered_msg->data.resize(filtered_msg->row_step);
-        filtered_msg->is_dense = true;
-        for (size_t i = 0; i < filtered_frame->points.size(); i++) {
-          float* ptr = reinterpret_cast<float*>(filtered_msg->data.data() + point_step * i);
-          ptr[0] = static_cast<float>(filtered_frame->points[i].x());
-          ptr[1] = static_cast<float>(filtered_frame->points[i].y());
-          ptr[2] = static_cast<float>(filtered_frame->points[i].z());
-          if (!filtered_frame->intensities.empty()) {
-            ptr[3] = static_cast<float>(filtered_frame->intensities[i]);
-          }
-        }
-        filtered_points_pub->publish(std::move(filtered_msg));
+      if (filtered_points_voxel_pub->get_subscription_count() > 0) {
+        auto filtered_msg = create_pointcloud2_msg(msg->header, filtered_frame);
+        filtered_points_voxel_pub->publish(std::move(filtered_msg));
       }
       odometry_estimation->insert_frame(filtered_frame);
     }
 
     // Publish dynamic-only points
-    if (dynamic_points_pub->get_subscription_count() > 0) {
+    if (dynamic_points_voxel_pub->get_subscription_count() > 0) {
       auto dyn_frames = dynamic_object_rejection->get_dynamic_results();
       for (const auto& dyn_frame : dyn_frames) {
         if (!dyn_frame || dyn_frame->points.empty()) continue;
-        auto dyn_msg = std::make_unique<sensor_msgs::msg::PointCloud2>();
-        dyn_msg->header = msg->header;
-        dyn_msg->header.stamp = rclcpp::Time(static_cast<int64_t>(dyn_frame->stamp * 1e9));
-        dyn_msg->height = 1;
-        dyn_msg->width = dyn_frame->points.size();
-        dyn_msg->fields.resize(3);
-        for (int i = 0; i < 3; i++) {
-          dyn_msg->fields[i].name = std::vector<std::string>{"x", "y", "z"}[i];
-          dyn_msg->fields[i].offset = sizeof(float) * i;
-          dyn_msg->fields[i].datatype = sensor_msgs::msg::PointField::FLOAT32;
-          dyn_msg->fields[i].count = 1;
-        }
-        int dyn_step = sizeof(float) * 3;
-        if (!dyn_frame->intensities.empty()) {
-          sensor_msgs::msg::PointField ifield;
-          ifield.name = "intensity";
-          ifield.offset = dyn_step;
-          ifield.datatype = sensor_msgs::msg::PointField::FLOAT32;
-          ifield.count = 1;
-          dyn_msg->fields.push_back(ifield);
-          dyn_step += sizeof(float);
-        }
-        dyn_msg->is_bigendian = false;
-        dyn_msg->point_step = dyn_step;
-        dyn_msg->row_step = dyn_step * dyn_msg->width;
-        dyn_msg->data.resize(dyn_msg->row_step);
-        dyn_msg->is_dense = true;
-        for (size_t i = 0; i < dyn_frame->points.size(); i++) {
-          float* ptr = reinterpret_cast<float*>(dyn_msg->data.data() + dyn_step * i);
-          ptr[0] = static_cast<float>(dyn_frame->points[i].x());
-          ptr[1] = static_cast<float>(dyn_frame->points[i].y());
-          ptr[2] = static_cast<float>(dyn_frame->points[i].z());
-          if (!dyn_frame->intensities.empty()) {
-            ptr[3] = static_cast<float>(dyn_frame->intensities[i]);
-          }
-        }
-        dynamic_points_pub->publish(std::move(dyn_msg));
+        auto dyn_msg = create_pointcloud2_msg(msg->header, dyn_frame);
+        dynamic_points_voxel_pub->publish(std::move(dyn_msg));
       }
     }
   } else {
@@ -441,6 +410,29 @@ size_t GlimROS::points_callback(const sensor_msgs::msg::PointCloud2::ConstShared
 
   return workload;
 }
+
+
+
+#ifdef GLIM_USE_DYNAMIC_REJECTION_BBOX
+void GlimROS::bbox_callback(const visualization_msgs::msg::MarkerArray::ConstSharedPtr msg) {
+
+  std::vector<BoundingBox> bboxes;
+  for (const auto& marker : msg->markers) {
+    if (marker.type != visualization_msgs::msg::Marker::CUBE) continue;
+
+    BoundingBox bbox(
+        Eigen::Vector3d(marker.scale.x, marker.scale.y, marker.scale.z),
+        Eigen::Vector3d(marker.pose.position.x, marker.pose.position.y, marker.pose.position.z),
+        Eigen::Quaterniond(marker.pose.orientation.w, marker.pose.orientation.x, marker.pose.orientation.y, marker.pose.orientation.z).toRotationMatrix()
+    );
+    bboxes.push_back(bbox);
+  }
+  if (dyn_bbox_rejection) {
+    dyn_bbox_rejection->update_bboxes(bboxes);
+  }
+}
+
+#endif
 
 bool GlimROS::needs_wait() {
   for (const auto& ext_module : extension_modules) {
@@ -571,6 +563,11 @@ void GlimROS::save(const std::string& path) {
     module->at_exit(path);
   }
 }
+
+
+
+
+
 
 }  // namespace glim
 

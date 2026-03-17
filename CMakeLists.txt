@@ -81,6 +81,14 @@ target_link_libraries(validator_node
   glim_ros
 )
 
+### publish_bbox ###
+ament_auto_add_executable(publish_bbox
+  src/publish_bbox.cpp
+)
+target_link_libraries(publish_bbox
+  glim_ros
+)
+
 if(BUILD_WITH_VIEWER)
   ### offline_viewer ###
   ament_auto_add_executable(offline_viewer
