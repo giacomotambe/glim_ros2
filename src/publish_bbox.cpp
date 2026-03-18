@@ -32,6 +32,7 @@ public:
             {2.0, 1.0, 0.5, 0.8, 0.8, 0.8},
             {0.0, 0.0, 0.5, 1.5, 0.3, 1.2}
         };
+        bbox_scale_ = 2.0; // scala per ingrandire le box (opzionale)
     }
 
 private:
@@ -44,7 +45,7 @@ private:
         {
             visualization_msgs::msg::Marker marker;
 
-            marker.header.frame_id = "map";
+            marker.header.frame_id = "velodyne";
             marker.header.stamp = this->get_clock()->now();
 
             marker.ns = "bounding_boxes";
@@ -62,9 +63,9 @@ private:
             marker.pose.orientation.w = 1.0;
 
             // Dimensioni
-            marker.scale.x = box.dx;
-            marker.scale.y = box.dy;
-            marker.scale.z = box.dz;
+            marker.scale.x = box.dx * bbox_scale_;
+            marker.scale.y = box.dy * bbox_scale_;
+            marker.scale.z = box.dz * bbox_scale_;
 
             // Colore (rosso variabile)
             marker.color.r = 1.0;
@@ -84,6 +85,7 @@ private:
 
     rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr publisher_;
     rclcpp::TimerBase::SharedPtr timer_;
+    float bbox_scale_;
 };
 
 int main(int argc, char * argv[])
