@@ -271,7 +271,7 @@ GlimROS::GlimROS(const rclcpp::NodeOptions& options) : Node("glim_ros", options)
         "~/wall_points", 10);
     wall_bbox_pub_ = this->create_publisher<visualization_msgs::msg::MarkerArray>(
         "~/wall_bboxes", 10);
-    cluster_bbox_pub = this->create_publisher<visualization_msgs::msg::MarkerArray>(
+    dynamic_cluster_bboxes_pub = this->create_publisher<visualization_msgs::msg::MarkerArray>(
         "~/cluster_bboxes", 10);
 
   }
@@ -471,6 +471,8 @@ size_t GlimROS::points_callback(const sensor_msgs::msg::PointCloud2::ConstShared
       }
     }
 
+
+
     // ── Pubblica bounding box delle pareti dal registry ───────────────────────
     if (wall_bbox_registry_ && !wall_bbox_registry_->bboxes().empty()) {
       visualization_msgs::msg::MarkerArray wall_marker_array;
@@ -484,11 +486,88 @@ size_t GlimROS::points_callback(const sensor_msgs::msg::PointCloud2::ConstShared
 
     // publish bounding box of dynamic clusters
     
-    const auto& cluster_bboxes = dynamic_object_rejection->get_last_cluster_bboxes();
-    if (!cluster_bboxes.empty()) {
-      publish_bounding_boxes(
-          msg->header, cluster_bboxes, "cluster_bboxes",
-          false, cluster_bbox_pub);
+     // --- Bounding box dei cluster dinamici ---
+    auto cluster_bbox_sets = dynamic_object_rejection->get_cluster_bbox_results();
+    
+    for (const auto& bboxes : cluster_bbox_sets) {
+      visualization_msgs::msg::MarkerArray bbox_array;
+      // Prima pubblica un marker DELETE_ALL per pulire i marker del frame precedente
+      visualization_msgs::msg::Marker delete_marker;
+      delete_marker.header.frame_id = "velodyne";
+      delete_marker.header.stamp    = this->now();
+      delete_marker.ns              = "dynamic_clusters";
+      delete_marker.action          = visualization_msgs::msg::Marker::DELETEALL;
+      bbox_array.markers.push_back(delete_marker);
+
+      int marker_id = 0;
+      for (const auto& bbox : bboxes) {
+        // --- Cubo wireframe (LINE_LIST sui 12 spigoli) ---
+        visualization_msgs::msg::Marker marker;
+        marker.header.frame_id = "velodyne";
+        marker.header.stamp    = this->now();
+        marker.ns              = "dynamic_clusters";
+        marker.id              = marker_id++;
+        marker.type            = visualization_msgs::msg::Marker::LINE_LIST;
+        marker.action          = visualization_msgs::msg::Marker::ADD;
+        marker.lifetime        = rclcpp::Duration::from_seconds(0.2);
+
+        // Spessore linea [m]
+        marker.scale.x = 0.05;
+
+        // Colore: rosso semitrasparente
+        marker.color.r = 1.0f;
+        marker.color.g = 0.2f;
+        marker.color.b = 0.0f;
+        marker.color.a = 0.9f;
+
+        // Orientamento (quaternione dalla matrice di rotazione OBB)
+        const Eigen::Quaterniond q(bbox.get_rotation());
+        marker.pose.position.x    = bbox.get_center().x();
+        marker.pose.position.y    = bbox.get_center().y();
+        marker.pose.position.z    = bbox.get_center().z();
+        marker.pose.orientation.w = q.w();
+        marker.pose.orientation.x = q.x();
+        marker.pose.orientation.y = q.y();
+        marker.pose.orientation.z = q.z();
+
+        // I 12 spigoli del cubo in coordinate locali (half-extents)
+        const Eigen::Vector3d h = bbox.get_size() * 0.5;
+
+        // 8 vertici in coordinate locali
+        const std::array<Eigen::Vector3d, 8> v = {{
+          { -h.x(), -h.y(), -h.z() },
+          {  h.x(), -h.y(), -h.z() },
+          {  h.x(),  h.y(), -h.z() },
+          { -h.x(),  h.y(), -h.z() },
+          { -h.x(), -h.y(),  h.z() },
+          {  h.x(), -h.y(),  h.z() },
+          {  h.x(),  h.y(),  h.z() },
+          { -h.x(),  h.y(),  h.z() },
+        }};
+
+        // 12 spigoli (coppie di indici)
+        const std::array<std::pair<int,int>, 12> edges = {{
+          {0,1},{1,2},{2,3},{3,0},  // faccia inferiore
+          {4,5},{5,6},{6,7},{7,4},  // faccia superiore
+          {0,4},{1,5},{2,6},{3,7},  // spigoli verticali
+        }};
+
+        auto to_point = [](const Eigen::Vector3d& p) {
+          geometry_msgs::msg::Point pt;
+          pt.x = p.x(); pt.y = p.y(); pt.z = p.z();
+          return pt;
+        };
+
+        for (const auto& [a, b] : edges) {
+          marker.points.push_back(to_point(v[a]));
+          marker.points.push_back(to_point(v[b]));
+        }
+
+        bbox_array.markers.push_back(marker);
+      }
+
+      dynamic_cluster_bboxes_pub->publish(bbox_array);
+      spdlog::info("[glim_ros] published {} dynamic cluster bboxes", bboxes.size());
     }
     
     
