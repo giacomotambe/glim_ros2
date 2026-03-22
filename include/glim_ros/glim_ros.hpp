@@ -22,6 +22,7 @@
 #include <glim/dynamic_rejection/dynamic_voxelmap_cpu.hpp>
 #include <glim/dynamic_rejection/voxel_filtering.hpp>
 #include <glim/dynamic_rejection/wall_bbox.hpp>
+#include <glim/dynamic_rejection/dynamic_cluster_extractor.hpp>
 
 namespace glim {
 
@@ -65,6 +66,13 @@ private:
   /// Publish a PointCloud2 containing only the wall-classified voxel centroids.
   void publish_wall_voxelmap(const std_msgs::msg::Header& header,
                              const WallFilterResult& wf_result);
+  
+  void publish_bounding_boxes(
+      const std_msgs::msg::Header& header,
+      const std::vector<BoundingBox>& bboxes,
+      const std::string& ns,
+      bool wall,
+      rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr pub);
 
   // ---------------------------------------------------------------------------
   // Core modules
@@ -85,11 +93,12 @@ private:
   // Two-stage pipeline: WallFilter → DynamicObjectRejectionCPU,
   // wrapped in an async thread by AsyncDynamicObjectRejection.
   // ---------------------------------------------------------------------------
+
   std::shared_ptr<glim::WallFilter>               wall_filter;
   std::shared_ptr<glim::AsyncDynamicObjectRejection> dynamic_object_rejection;
 
   std::shared_ptr<glim::WallBBoxRegistry> wall_bbox_registry_;
-  rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr wall_bbox_pub_;
+  std::shared_ptr<glim::DynamicClusterExtractor> cluster_extractor;
   // ---------------------------------------------------------------------------
   // Pose Kalman filter (shared with odometry / dynamic rejection)
   // ---------------------------------------------------------------------------
@@ -135,7 +144,8 @@ private:
   rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr     dynamic_points_voxel_pub;
   rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr voxelmap_pub;
   rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr     wall_points_pub;
-
+  rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr cluster_bbox_pub;
+  rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr wall_bbox_pub_;
   // Kalman-filtered pose
   rclcpp::Publisher<geometry_msgs::msg::PoseStamped>::SharedPtr filtered_pose_pub;
 

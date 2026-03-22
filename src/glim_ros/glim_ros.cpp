@@ -144,7 +144,7 @@ GlimROS::GlimROS(const rclcpp::NodeOptions& options) : Node("glim_ros", options)
     wall_bbox_registry_ = std::make_shared<glim::WallBBoxRegistry>();
     wall_filter = std::make_shared<glim::WallFilter>(glim::WallFilterConfig{}, wall_bbox_registry_);
     
-
+    cluster_extractor = std::make_shared<glim::DynamicClusterExtractor>();
     // Dynamic scorer
     auto dyn_rejection = std::make_shared<glim::DynamicObjectRejectionCPU>(
         glim::DynamicObjectRejectionParamsCPU(),
@@ -152,7 +152,7 @@ GlimROS::GlimROS(const rclcpp::NodeOptions& options) : Node("glim_ros", options)
 
     // Async wrapper owns both
     dynamic_object_rejection =
-        std::make_shared<glim::AsyncDynamicObjectRejection>(dyn_rejection, wall_filter);
+        std::make_shared<glim::AsyncDynamicObjectRejection>(dyn_rejection, wall_filter, cluster_extractor);
   }
 
   // ---------------------------------------------------------------------------
@@ -270,7 +270,10 @@ GlimROS::GlimROS(const rclcpp::NodeOptions& options) : Node("glim_ros", options)
     wall_points_pub = this->create_publisher<sensor_msgs::msg::PointCloud2>(
         "~/wall_points", 10);
     wall_bbox_pub_ = this->create_publisher<visualization_msgs::msg::MarkerArray>(
-    "~/wall_bboxes", 10);
+        "~/wall_bboxes", 10);
+    cluster_bbox_pub = this->create_publisher<visualization_msgs::msg::MarkerArray>(
+        "~/cluster_bboxes", 10);
+
   }
 
   filtered_pose_pub = this->create_publisher<geometry_msgs::msg::PoseStamped>(
@@ -471,52 +474,23 @@ size_t GlimROS::points_callback(const sensor_msgs::msg::PointCloud2::ConstShared
     // ── Pubblica bounding box delle pareti dal registry ───────────────────────
     if (wall_bbox_registry_ && !wall_bbox_registry_->bboxes().empty()) {
       visualization_msgs::msg::MarkerArray wall_marker_array;
-
       
-
+    
       const auto& bboxes = wall_bbox_registry_->bboxes();
-      for (int i = 0; i < static_cast<int>(bboxes.size()); ++i) {
-          const auto& bbox = bboxes[i];
-
-          visualization_msgs::msg::Marker m;
-          m.header.frame_id = "velodyne";
-          m.header.stamp    = this->now();
-          m.ns              = "wall_bboxes";
-          m.id              = i;
-          m.type            = visualization_msgs::msg::Marker::CUBE;
-          m.action          = visualization_msgs::msg::Marker::ADD;
-
-          // Posizione
-          const Eigen::Vector3d& c = bbox.get_center();
-          m.pose.position.x = c.x();
-          m.pose.position.y = c.y();
-          m.pose.position.z = c.z();
-
-          // Orientamento
-          const Eigen::Quaterniond q(bbox.get_rotation());
-          m.pose.orientation.w = q.w();
-          m.pose.orientation.x = q.x();
-          m.pose.orientation.y = q.y();
-          m.pose.orientation.z = q.z();
-
-          // Dimensioni
-          const Eigen::Vector3d& s = bbox.get_size();
-          m.scale.x = s.x();
-          m.scale.y = s.y();
-          m.scale.z = s.z();
-
-          // Colore: verde semitrasparente
-          m.color.r = 0.0f;
-          m.color.g = 1.0f;
-          m.color.b = 0.0f;
-          m.color.a = 0.3f;
-
-          wall_marker_array.markers.push_back(m);
-        }
-
-        wall_bbox_pub_->publish(wall_marker_array);
-        spdlog::debug("[glim_ros] published {} wall bboxes", bboxes.size());
+      publish_bounding_boxes(
+          msg->header, bboxes, "wall_bboxes",
+          true, wall_bbox_pub_);
     }
+
+    // publish bounding box of dynamic clusters
+    
+    const auto& cluster_bboxes = dynamic_object_rejection->get_last_cluster_bboxes();
+    if (!cluster_bboxes.empty()) {
+      publish_bounding_boxes(
+          msg->header, cluster_bboxes, "cluster_bboxes",
+          false, cluster_bbox_pub);
+    }
+    
     
   // ---------------------------------------------------------------------------
   // No dynamic rejection
@@ -531,6 +505,59 @@ size_t GlimROS::points_callback(const sensor_msgs::msg::PointCloud2::ConstShared
 // =============================================================================
 // publish_voxelmap()  —  private helper
 // =============================================================================
+
+
+void GlimROS::publish_bounding_boxes(
+    const std_msgs::msg::Header& header,
+    const std::vector<BoundingBox>& bboxes,
+    const std::string& ns,
+    bool wall,
+    rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr pub)
+{
+  visualization_msgs::msg::MarkerArray marker_array;
+
+  for (size_t i = 0; i < bboxes.size(); ++i) {
+    const auto& bbox = bboxes[i];
+
+    visualization_msgs::msg::Marker m;
+    m.header.frame_id = header.frame_id;
+    m.header.stamp    = this->now();
+    m.ns              = ns;
+    m.id              = static_cast<int>(i);
+    m.type            = visualization_msgs::msg::Marker::CUBE;
+    m.action          = visualization_msgs::msg::Marker::ADD;
+
+    // Posizione
+    const Eigen::Vector3d& c = bbox.get_center();
+    m.pose.position.x = c.x();
+    m.pose.position.y = c.y();
+    m.pose.position.z = c.z();
+
+    // Orientamento
+    const Eigen::Quaterniond q(bbox.get_rotation());
+    m.pose.orientation.w = q.w();
+    m.pose.orientation.x = q.x();
+    m.pose.orientation.y = q.y();
+    m.pose.orientation.z = q.z();
+
+    // Dimensioni
+    const Eigen::Vector3d& s = bbox.get_size();
+    m.scale.x = s.x();
+    m.scale.y = s.y();
+    m.scale.z = s.z();
+
+    // Colore
+    if (wall) {
+      m.color.r = 0.0f; m.color.g = 1.0f; m.color.b = 0.0f; m.color.a = 0.3f; // green for walls
+    } else {
+      m.color.r = 1.0f; m.color.g = 0.0f; m.color.b = 0.0f; m.color.a = 0.9f; // Red for dynamic clusters
+    }
+
+    marker_array.markers.push_back(m);
+  }
+
+  pub->publish(marker_array);
+}
 
 void GlimROS::publish_voxelmap(
     const std_msgs::msg::Header&              header,
