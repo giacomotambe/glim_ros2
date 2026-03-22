@@ -491,13 +491,6 @@ size_t GlimROS::points_callback(const sensor_msgs::msg::PointCloud2::ConstShared
     
     for (const auto& bboxes : cluster_bbox_sets) {
       visualization_msgs::msg::MarkerArray bbox_array;
-      // Prima pubblica un marker DELETE_ALL per pulire i marker del frame precedente
-      visualization_msgs::msg::Marker delete_marker;
-      delete_marker.header.frame_id = "velodyne";
-      delete_marker.header.stamp    = this->now();
-      delete_marker.ns              = "dynamic_clusters";
-      delete_marker.action          = visualization_msgs::msg::Marker::DELETEALL;
-      bbox_array.markers.push_back(delete_marker);
 
       int marker_id = 0;
       for (const auto& bbox : bboxes) {
