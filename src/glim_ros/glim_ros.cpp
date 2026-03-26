@@ -125,6 +125,7 @@ GlimROS::GlimROS(const rclcpp::NodeOptions& options) : Node("glim_ros", options)
   // ---------------------------------------------------------------------------
   // Dynamic rejection — BBOX mode
   // ---------------------------------------------------------------------------
+  spdlog::info("dynamic_rejection_type: {}", dynamic_rejection_type);
   if (dynamic_rejection_type == "BBOX") {
     spdlog::info("dynamic rejection: BBOX mode");
     dynamic_bbox_rejection = std::make_shared<glim::DynamicBBoxRejection>();
@@ -142,7 +143,9 @@ GlimROS::GlimROS(const rclcpp::NodeOptions& options) : Node("glim_ros", options)
 
     // Wall filter (reads its own config section internally)
     wall_bbox_registry_ = std::make_shared<glim::WallBBoxRegistry>();
-    wall_filter = std::make_shared<glim::WallFilter>(glim::WallFilterConfig{}, wall_bbox_registry_);
+
+    wall_filter = std::make_shared<glim::WallFilter>(
+        glim::WallFilterConfig{}, wall_bbox_registry_, pose_kalman_filter);
     
     cluster_extractor = std::make_shared<glim::DynamicClusterExtractor>();
     // Dynamic scorer
@@ -440,7 +443,6 @@ size_t GlimROS::points_callback(const sensor_msgs::msg::PointCloud2::ConstShared
   // Pipeline: WallFilter → DynamicObjectRejectionCPU (both run on async thread)
   // ---------------------------------------------------------------------------
   } else if (dynamic_rejection_type == "VOXEL") {
-
     // Enqueue frame — WallFilter + rejection run on the background thread
     dynamic_object_rejection->insert_frame(preprocessed);
 
@@ -502,7 +504,7 @@ size_t GlimROS::points_callback(const sensor_msgs::msg::PointCloud2::ConstShared
         marker.id              = marker_id++;
         marker.type            = visualization_msgs::msg::Marker::LINE_LIST;
         marker.action          = visualization_msgs::msg::Marker::ADD;
-        marker.lifetime        = rclcpp::Duration::from_seconds(0.2);
+        marker.lifetime = rclcpp::Duration::from_seconds(0.5);
 
         // Spessore linea [m]
         marker.scale.x = 0.05;
@@ -598,6 +600,7 @@ void GlimROS::publish_bounding_boxes(
     m.id              = static_cast<int>(i);
     m.type            = visualization_msgs::msg::Marker::CUBE;
     m.action          = visualization_msgs::msg::Marker::ADD;
+    m.lifetime = rclcpp::Duration::from_seconds(0.2);
 
     // Posizione
     const Eigen::Vector3d& c = bbox.get_center();
@@ -767,7 +770,7 @@ void GlimROS::timer_callback() {
       }
       kf_imu_queue_.clear();
     }
-
+    
     const auto& latest = estimation_frames.back();
     if (latest) {
       const Eigen::Isometry3d T_filtered =
