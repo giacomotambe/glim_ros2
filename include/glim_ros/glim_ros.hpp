@@ -103,6 +103,12 @@ private:
   // Pose Kalman filter (shared with odometry / dynamic rejection)
   // ---------------------------------------------------------------------------
   std::shared_ptr<glim::PoseKalmanFilter> pose_kalman_filter;
+  Eigen::Isometry3d last_kf_pose_ = Eigen::Isometry3d::Identity();
+  std::vector<geometry_msgs::msg::Point> traj_points_;
+  Eigen::Isometry3d current_pose = Eigen::Isometry3d::Identity();
+
+
+
   double last_imu_stamp_;
   struct KfImuData { Eigen::Vector3d acc; Eigen::Vector3d gyro; double dt; };
   std::mutex              kf_imu_mutex_;
@@ -148,6 +154,7 @@ private:
   rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr wall_bbox_pub_;
   // Kalman-filtered pose
   rclcpp::Publisher<geometry_msgs::msg::PoseStamped>::SharedPtr filtered_pose_pub;
+  rclcpp::Publisher<visualization_msgs::msg::Marker>::SharedPtr filtered_pose_marker_pub;
 
 #ifdef BUILD_WITH_CV_BRIDGE
   image_transport::Subscriber image_sub;

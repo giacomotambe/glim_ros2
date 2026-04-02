@@ -281,6 +281,8 @@ GlimROS::GlimROS(const rclcpp::NodeOptions& options) : Node("glim_ros", options)
 
   filtered_pose_pub = this->create_publisher<geometry_msgs::msg::PoseStamped>(
       "~/filtered_pose", 10);
+  filtered_pose_marker_pub = this->create_publisher<visualization_msgs::msg::Marker>(
+      "~/filtered_pose_marker", 10);
 
 #ifdef BUILD_WITH_CV_BRIDGE
   qos = get_qos_settings(config_ros, "glim_ros", "image_qos");
@@ -572,6 +574,42 @@ size_t GlimROS::points_callback(const sensor_msgs::msg::PointCloud2::ConstShared
   } else {
     odometry_estimation->insert_frame(preprocessed);
   }
+  Eigen::Isometry3d new_pose = pose_kalman_filter->getPose();
+  Eigen::Isometry3d T_delta = new_pose * last_kf_pose_.inverse();
+  
+  // current_pose = T_delta * last_kf_pose_; // Applica la trasformazione delta al filtro di Kalman
+  current_pose = new_pose; // Usa direttamente la nuova posa filtrata
+  last_kf_pose_ = new_pose; // Aggiorna la posa del filtro di Kalman
+  // Publish filtered pose as a marker
+  visualization_msgs::msg::Marker marker;
+  marker.header.frame_id = "map";
+  marker.header.stamp = this->now();
+  marker.ns = "filtered_pose";
+  marker.id = 0;
+  marker.type = visualization_msgs::msg::Marker::LINE_STRIP;
+  marker.action = visualization_msgs::msg::Marker::ADD;
+  Eigen::Quaterniond q(current_pose.rotation());
+
+  marker.scale.x = 0.05;
+  marker.color.r = 0.0f;
+  marker.color.g = 1.0f;
+  marker.color.b = 0.0f;
+  marker.color.a = 1.0f;
+
+  const size_t MAX_POINTS = 1000;
+
+  geometry_msgs::msg::Point p;
+  p.x = current_pose.translation().x();
+  p.y = current_pose.translation().y();
+  p.z = current_pose.translation().z();
+
+  traj_points_.push_back(p);
+
+  if (traj_points_.size() > MAX_POINTS) {
+      traj_points_.erase(traj_points_.begin());
+  }
+  marker.points = traj_points_;
+  filtered_pose_marker_pub->publish(marker);
 
   return odometry_estimation->workload();
 }
