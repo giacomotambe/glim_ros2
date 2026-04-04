@@ -147,7 +147,7 @@ GlimROS::GlimROS(const rclcpp::NodeOptions& options) : Node("glim_ros", options)
     wall_filter = std::make_shared<glim::WallFilter>(
         glim::WallFilterConfig{}, wall_bbox_registry_, pose_kalman_filter);
     
-    cluster_extractor = std::make_shared<glim::DynamicClusterExtractor>();
+    cluster_extractor = std::make_shared<glim::DynamicClusterExtractor>(pose_kalman_filter);
     // Dynamic scorer
     auto dyn_rejection = std::make_shared<glim::DynamicObjectRejectionCPU>(
         glim::DynamicObjectRejectionParamsCPU(),
@@ -511,12 +511,20 @@ size_t GlimROS::points_callback(const sensor_msgs::msg::PointCloud2::ConstShared
         // Spessore linea [m]
         marker.scale.x = 0.05;
 
-        // Colore: rosso semitrasparente
-        marker.color.r = 1.0f;
-        marker.color.g = 0.2f;
-        marker.color.b = 0.0f;
-        marker.color.a = 0.9f;
-
+        // Colore:  
+        if (bbox.is_dynamic_bbox()) {
+          // arancione per cluster dinamici
+          marker.color.r = 1.0f;
+          marker.color.g = 0.5f;
+          marker.color.b = 0.0f;
+          marker.color.a = 0.9f;
+        } else {
+          // verde per cluster statici
+          marker.color.r = 0.0f;
+          marker.color.g = 1.0f;
+          marker.color.b = 0.0f;
+          marker.color.a = 0.9f;
+        }
         // Orientamento (quaternione dalla matrice di rotazione OBB)
         const Eigen::Quaterniond q(bbox.get_rotation());
         marker.pose.position.x    = bbox.get_center().x();
@@ -564,7 +572,7 @@ size_t GlimROS::points_callback(const sensor_msgs::msg::PointCloud2::ConstShared
       }
 
       dynamic_cluster_bboxes_pub->publish(bbox_array);
-      spdlog::info("[glim_ros] published {} dynamic cluster bboxes", bboxes.size());
+      spdlog::debug("[glim_ros] published {} dynamic cluster bboxes", bboxes.size());
     }
     
     

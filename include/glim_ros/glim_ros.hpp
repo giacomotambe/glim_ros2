@@ -22,7 +22,7 @@
 #include <glim/dynamic_rejection/dynamic_voxelmap_cpu.hpp>
 #include <glim/dynamic_rejection/voxel_filtering.hpp>
 #include <glim/dynamic_rejection/wall_bbox.hpp>
-#include <glim/dynamic_rejection/dynamic_cluster_extractor.hpp>
+#include <glim/dynamic_rejection/cluster_extractor.hpp>
 
 namespace glim {
 
