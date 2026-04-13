@@ -541,16 +541,43 @@ size_t GlimROS::points_callback(const sensor_msgs::msg::PointCloud2::ConstShared
       return marker;
     };
 
+    // Helper: TEXT_VIEW_FACING label above a bbox showing track id
+    auto make_label_marker = [&](const glim::BoundingBox& bbox,
+                                 const std::string& ns, int id,
+                                 float r, float g, float b)
+    {
+      visualization_msgs::msg::Marker m;
+      m.header.frame_id = "velodyne";
+      m.header.stamp    = this->now();
+      m.ns              = ns;
+      m.id              = id;
+      m.type            = visualization_msgs::msg::Marker::TEXT_VIEW_FACING;
+      m.action          = visualization_msgs::msg::Marker::ADD;
+      m.lifetime        = rclcpp::Duration::from_seconds(0.5);
+      m.scale.z         = 0.25;  // text height [m]
+      m.color.r = r; m.color.g = g; m.color.b = b; m.color.a = 1.0f;
+      // Place label at the top face of the bbox
+      m.pose.position.x = bbox.get_center().x();
+      m.pose.position.y = bbox.get_center().y();
+      m.pose.position.z = bbox.get_center().z() + bbox.get_size().z() * 0.5 + 0.15;
+      m.pose.orientation.w = 1.0;
+      const int tid = bbox.get_track_id();
+      m.text = (tid >= 0) ? ("T" + std::to_string(tid)) : "?";
+      return m;
+    };
+
     // --- Bounding box dei cluster del frame corrente ---
     auto cluster_bbox_sets = dynamic_object_rejection->get_cluster_bbox_results();
     for (const auto& bboxes : cluster_bbox_sets) {
       visualization_msgs::msg::MarkerArray bbox_array;
       int id = 0;
       for (const auto& bbox : bboxes) {
-        if (bbox.is_dynamic_bbox())
-          bbox_array.markers.push_back(make_bbox_marker(bbox, "cluster_current", id++, 1.0f, 0.5f, 0.0f, 0.9f));
-        else
-          bbox_array.markers.push_back(make_bbox_marker(bbox, "cluster_current", id++, 0.0f, 1.0f, 0.0f, 0.9f));
+        const bool dyn = bbox.is_dynamic_bbox();
+        const float r = dyn ? 1.0f : 0.0f;
+        const float g = dyn ? 0.5f : 1.0f;
+        bbox_array.markers.push_back(make_bbox_marker(bbox, "cluster_current", id, r, g, 0.0f, 0.9f));
+        bbox_array.markers.push_back(make_label_marker(bbox, "cluster_labels",  id, r, g, 0.0f));
+        ++id;
       }
       dynamic_cluster_bboxes_pub->publish(bbox_array);
       spdlog::debug("[glim_ros] published {} cluster bboxes (current frame)", bboxes.size());
