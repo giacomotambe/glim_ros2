@@ -128,7 +128,7 @@ GlimROS::GlimROS(const rclcpp::NodeOptions& options) : Node("glim_ros", options)
   spdlog::info("dynamic_rejection_type: {}", dynamic_rejection_type);
   if (dynamic_rejection_type == "BBOX") {
     spdlog::info("dynamic rejection: BBOX mode");
-    dynamic_bbox_rejection = std::make_shared<glim::DynamicBBoxRejection>();
+    dynamic_bbox_rejection = std::make_shared<glim::DynamicBBoxRejection>(pose_kalman_filter);
   }
 
   // ---------------------------------------------------------------------------
@@ -609,6 +609,7 @@ size_t GlimROS::points_callback(const sensor_msgs::msg::PointCloud2::ConstShared
   // No dynamic rejection
   // ---------------------------------------------------------------------------
   } else {
+    spdlog::debug("no dynamic rejection, feed preprocessed frame directly to odometry");
     odometry_estimation->insert_frame(preprocessed);
   }
   Eigen::Isometry3d new_pose = pose_kalman_filter->getPose();
@@ -647,7 +648,7 @@ size_t GlimROS::points_callback(const sensor_msgs::msg::PointCloud2::ConstShared
   }
   marker.points = traj_points_;
   filtered_pose_marker_pub->publish(marker);
-
+  spdlog::debug("published filtered pose marker with {} points", marker.points.size());
   return odometry_estimation->workload();
 }
 
@@ -803,7 +804,7 @@ void GlimROS::bbox_callback(
     const visualization_msgs::msg::MarkerArray::ConstSharedPtr msg)
 {
   if (dynamic_rejection_type != "BBOX") {
-    spdlog::warn("received bbox message but dynamic_rejection_type != BBOX");
+    spdlog::debug("received bbox message but dynamic_rejection_type != BBOX");
     return;
   }
 
@@ -830,7 +831,7 @@ void GlimROS::timer_callback() {
   for (const auto& mod : extension_modules) {
     if (!mod->ok()) { rclcpp::shutdown(); }
   }
-
+  spdlog::debug("timer callback: check odometry estimation results and publish");
   std::vector<glim::EstimationFrame::ConstPtr> estimation_frames;
   std::vector<glim::EstimationFrame::ConstPtr> marginalized_frames;
   odometry_estimation->get_results(estimation_frames, marginalized_frames);
@@ -882,6 +883,7 @@ void GlimROS::timer_callback() {
       }
     }
   }
+  spdlog::debug("timer callback done");
 }
 
 // =============================================================================
