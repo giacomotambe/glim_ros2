@@ -136,7 +136,7 @@ GlimROS::GlimROS(const rclcpp::NodeOptions& options) : Node("glim_ros", options)
   spdlog::info("dynamic_rejection_type: {}", dynamic_rejection_type);
   if (dynamic_rejection_type == "BBOX") {
     spdlog::info("dynamic rejection: BBOX mode");
-    dynamic_bbox_rejection = std::make_shared<glim::DynamicBBoxRejection>(pose_kalman_filter);
+    dynamic_bbox_rejection = std::make_shared<glim::DynamicBBoxRejection>();
   }
 
   // ---------------------------------------------------------------------------
