@@ -15,6 +15,9 @@
 #endif
 #include <visualization_msgs/msg/marker_array.hpp>
 #include <visualization_msgs/msg/marker.hpp>
+#include <jo_msgs/msg/obstacle_array.hpp>
+#include <tf2_ros/buffer.h>
+#include <tf2_ros/transform_listener.h>
 
 #include <std_msgs/msg/header.hpp>
 #include <glim/odometry/estimation_frame.hpp>
@@ -53,7 +56,7 @@ public:
 #endif
   size_t points_callback(const sensor_msgs::msg::PointCloud2::ConstSharedPtr msg);
 
-  void bbox_callback(const visualization_msgs::msg::MarkerArray::ConstSharedPtr msg);
+  void bbox_callback(const jo_msgs::msg::ObstacleArray::ConstSharedPtr msg);
   void wait(bool auto_quit = false);
   void save(const std::string& path);
 
@@ -125,6 +128,13 @@ private:
   std::string dynamic_rejection_type;
   std::string intensity_field;
   std::string ring_field;
+  std::string lidar_frame_id_;
+
+  std::shared_ptr<tf2_ros::Buffer>            tf_buffer_;
+  std::shared_ptr<tf2_ros::TransformListener> tf_listener_;
+
+  Eigen::Isometry3d T_velodyne_base_       = Eigen::Isometry3d::Identity();
+  bool              T_velodyne_base_valid_  = false;
 
   // ---------------------------------------------------------------------------
   // Extension modules
@@ -141,9 +151,10 @@ private:
   rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr points_sub;
 
   // BBOX mode
-  rclcpp::Subscription<visualization_msgs::msg::MarkerArray>::SharedPtr bbox_sub;
+  rclcpp::Subscription<jo_msgs::msg::ObstacleArray>::SharedPtr bbox_sub;
   rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr filtered_points_bbox_pub;
   rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr dynamic_points_bbox_pub;
+  rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr bbox_markers_pub;
 
   // VOXEL mode
   rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr     filtered_points_voxel_pub;

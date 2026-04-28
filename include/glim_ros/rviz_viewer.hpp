@@ -30,7 +30,7 @@ class TrajectoryManager;
 /**
  * @brief Rviz-based viewer
  */
-class RvizViewer : public ExtensionModuleROS2 {
+class RvizViewer : public ExtensionModuleROS2, public rclcpp::Node {
 public:
   RvizViewer();
   ~RvizViewer();
@@ -63,22 +63,33 @@ private:
   bool publish_imu2lidar;
   double tf_time_offset;
 
-  std::shared_ptr<rclcpp::Publisher<sensor_msgs::msg::PointCloud2>> points_pub;
-  std::shared_ptr<rclcpp::Publisher<sensor_msgs::msg::PointCloud2>> aligned_points_pub;
+  bool publish_tf = true;
+
   std::shared_ptr<rclcpp::Publisher<sensor_msgs::msg::PointCloud2>> map_pub;
 
-  std::shared_ptr<rclcpp::Publisher<nav_msgs::msg::Odometry>> odom_pub;
-  std::shared_ptr<rclcpp::Publisher<geometry_msgs::msg::PoseStamped>> pose_pub;
-  std::shared_ptr<rclcpp::Publisher<nav_msgs::msg::Odometry>> odom_scanend_pub;
-  std::shared_ptr<rclcpp::Publisher<geometry_msgs::msg::PoseStamped>> pose_scanend_pub;
-
+  std::shared_ptr<rclcpp::Publisher<sensor_msgs::msg::PointCloud2>> points_pub;
   std::shared_ptr<rclcpp::Publisher<sensor_msgs::msg::PointCloud2>> points_corrected_pub;
+
+  std::shared_ptr<rclcpp::Publisher<sensor_msgs::msg::PointCloud2>> aligned_points_pub;
   std::shared_ptr<rclcpp::Publisher<sensor_msgs::msg::PointCloud2>> aligned_points_corrected_pub;
 
+  std::shared_ptr<rclcpp::Publisher<nav_msgs::msg::Odometry>> odom_pub;
+  std::shared_ptr<rclcpp::Publisher<nav_msgs::msg::Odometry>> odom_scanend_pub;
   std::shared_ptr<rclcpp::Publisher<nav_msgs::msg::Odometry>> odom_corrected_pub;
-  std::shared_ptr<rclcpp::Publisher<geometry_msgs::msg::PoseStamped>> pose_corrected_pub;
   std::shared_ptr<rclcpp::Publisher<nav_msgs::msg::Odometry>> odom_scanend_corrected_pub;
+  std::shared_ptr<rclcpp::Publisher<nav_msgs::msg::Odometry>> lidar_odom_pub;  // Odometry in LiDAR frame
+  std::shared_ptr<rclcpp::Publisher<nav_msgs::msg::Odometry>> lidar_odom_scanend_pub;
+  std::shared_ptr<rclcpp::Publisher<nav_msgs::msg::Odometry>> lidar_odom_corrected_pub;
+  std::shared_ptr<rclcpp::Publisher<nav_msgs::msg::Odometry>> lidar_odom_scanend_corrected_pub;
+
+  std::shared_ptr<rclcpp::Publisher<geometry_msgs::msg::PoseStamped>> pose_pub;
+  std::shared_ptr<rclcpp::Publisher<geometry_msgs::msg::PoseStamped>> pose_scanend_pub;
+  std::shared_ptr<rclcpp::Publisher<geometry_msgs::msg::PoseStamped>> pose_corrected_pub;
   std::shared_ptr<rclcpp::Publisher<geometry_msgs::msg::PoseStamped>> pose_scanend_corrected_pub;
+  std::shared_ptr<rclcpp::Publisher<geometry_msgs::msg::PoseStamped>> lidar_pose_pub;  // Pose in LiDAR frame
+  std::shared_ptr<rclcpp::Publisher<geometry_msgs::msg::PoseStamped>> lidar_pose_scanend_pub;
+  std::shared_ptr<rclcpp::Publisher<geometry_msgs::msg::PoseStamped>> lidar_pose_corrected_pub;
+  std::shared_ptr<rclcpp::Publisher<geometry_msgs::msg::PoseStamped>> lidar_pose_scanend_corrected_pub;
 
   std::mutex trajectory_mutex;
   std::unique_ptr<TrajectoryManager> trajectory;

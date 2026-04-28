@@ -19,6 +19,10 @@
 #include <sensor_msgs/msg/imu.hpp>
 #include <sensor_msgs/msg/image.hpp>
 #include <sensor_msgs/msg/point_cloud2.hpp>
+#include <jo_msgs/msg/obstacle_array.hpp>
+#include <tf2_ros/buffer.h>
+#include <tf2_ros/transform_listener.h>
+#include <tf2_eigen/tf2_eigen.hpp>
 
 #include <gtsam_points/optimizers/linearization_hook.hpp>
 #include <gtsam_points/cuda/nonlinear_factor_set_gpu_create.hpp>
@@ -101,6 +105,10 @@ GlimROS::GlimROS(const rclcpp::NodeOptions& options) : Node("glim_ros", options)
   ring_field      = config_sensors.param<std::string>("sensors", "ring_field",      "");
 
   dynamic_rejection_type = config_ros.param<std::string>("glim_ros", "dynamic_rejection_type", "NONE");
+  lidar_frame_id_ = config_ros.param<std::string>("glim_ros", "lidar_frame_id", "velodyne");
+
+  tf_buffer_   = std::make_shared<tf2_ros::Buffer>(this->get_clock());
+  tf_listener_ = std::make_shared<tf2_ros::TransformListener>(*tf_buffer_);
 
   // ---------------------------------------------------------------------------
   // GPU linearization hook
@@ -252,14 +260,16 @@ GlimROS::GlimROS(const rclcpp::NodeOptions& options) : Node("glim_ros", options)
 
   if (dynamic_rejection_type == "BBOX") {
     auto bbox_qos = get_qos_settings(config_ros, "glim_ros", "bbox_qos");
-    bbox_sub = this->create_subscription<visualization_msgs::msg::MarkerArray>(
+    bbox_sub = this->create_subscription<jo_msgs::msg::ObstacleArray>(
         bbox_topic, bbox_qos, std::bind(&GlimROS::bbox_callback, this, _1));
 
-    spdlog::info("advertise ~/filtered_points_bbox and ~/dynamic_points_bbox");
+    spdlog::info("advertise ~/filtered_points_bbox, ~/dynamic_points_bbox and ~/bbox_markers");
     filtered_points_bbox_pub = this->create_publisher<sensor_msgs::msg::PointCloud2>(
         "~/filtered_points_bbox", 10);
     dynamic_points_bbox_pub = this->create_publisher<sensor_msgs::msg::PointCloud2>(
         "~/dynamic_points_bbox", 10);
+    bbox_markers_pub = this->create_publisher<visualization_msgs::msg::MarkerArray>(
+        "~/bbox_markers", 10);
   }
 
   if (dynamic_rejection_type == "VOXEL") {
@@ -801,26 +811,50 @@ void GlimROS::publish_wall_voxelmap(
 // =============================================================================
 
 void GlimROS::bbox_callback(
-    const visualization_msgs::msg::MarkerArray::ConstSharedPtr msg)
+    const jo_msgs::msg::ObstacleArray::ConstSharedPtr msg)
 {
   if (dynamic_rejection_type != "BBOX") {
     spdlog::debug("received bbox message but dynamic_rejection_type != BBOX");
     return;
   }
 
-  for (const auto& marker : msg->markers) {
-    if (marker.type != visualization_msgs::msg::Marker::CUBE) continue;
-    BoundingBox bbox(
-        Eigen::Vector3d(marker.scale.x, marker.scale.y, marker.scale.z),
-        Eigen::Vector3d(marker.pose.position.x,
-                        marker.pose.position.y,
-                        marker.pose.position.z),
-        Eigen::Quaterniond(marker.pose.orientation.w,
-                           marker.pose.orientation.x,
-                           marker.pose.orientation.y,
-                           marker.pose.orientation.z).toRotationMatrix());
-    dynamic_bbox_rejection->insert_bounding_boxes(bbox);
+  // Look up transform from obstacle frame (odom) → lidar frame
+  Eigen::Isometry3d T_odom_base_link = pose_kalman_filter->getPose();
+  Eigen::Isometry3d T_base_odom = T_odom_base_link.inverse();
+  const std::string& src_frame = msg->header.frame_id;
+
+  // Step 1 — static part: base_link → velodyne (cache on first successful lookup)
+  if (!T_velodyne_base_valid_) {
+    try {
+      const auto tf = tf_buffer_->lookupTransform(lidar_frame_id_, "base_link", tf2::TimePointZero);
+      T_velodyne_base_ = tf2::transformToEigen(tf);
+      T_velodyne_base_valid_ = true;
+    } catch (const tf2::TransformException& e) {
+      RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 3000,
+          "bbox_callback: static TF base_link → %s not yet available: %s", lidar_frame_id_.c_str(), e.what());
+      return;
+    }
   }
+  Eigen::Isometry3d T_odom_lidar = T_velodyne_base_ * T_base_odom;
+  std::vector<BoundingBox> bboxes;
+  for (const auto& obs : msg->obstacles) {
+    const Eigen::Vector3d p_odom(obs.pose.position.x, obs.pose.position.y, obs.pose.position.z);
+    const Eigen::Quaterniond q_odom(obs.pose.orientation.w, obs.pose.orientation.x,
+                                    obs.pose.orientation.y, obs.pose.orientation.z);
+    const Eigen::Vector3d    p_lidar = T_odom_lidar * p_odom;
+    const Eigen::Matrix3d    R_lidar = T_odom_lidar.rotation() * q_odom.toRotationMatrix();
+
+    bboxes.emplace_back(
+        Eigen::Vector3d(obs.size.x, obs.size.y, obs.size.z),
+        p_lidar,
+        R_lidar);
+    dynamic_bbox_rejection->insert_bounding_boxes(bboxes.back());
+  }
+
+  std_msgs::msg::Header lidar_header;
+  lidar_header.stamp    = msg->header.stamp;
+  lidar_header.frame_id = lidar_frame_id_;
+  publish_bounding_boxes(lidar_header, bboxes, "bbox_input", false, bbox_markers_pub);
 }
 
 // =============================================================================
