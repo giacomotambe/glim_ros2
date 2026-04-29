@@ -133,8 +133,8 @@ private:
   std::shared_ptr<tf2_ros::Buffer>            tf_buffer_;
   std::shared_ptr<tf2_ros::TransformListener> tf_listener_;
 
-  Eigen::Isometry3d T_velodyne_base_       = Eigen::Isometry3d::Identity();
-  bool              T_velodyne_base_valid_  = false;
+  Eigen::Isometry3d T_velodyne_base_ = Eigen::Isometry3d::Identity();
+  bool              T_velodyne_base_valid = false;
 
   // ---------------------------------------------------------------------------
   // Extension modules

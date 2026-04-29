@@ -3,6 +3,7 @@
 #define GLIM_ROS2
 
 #include <deque>
+#include <sstream>
 #include <thread>
 #include <iostream>
 #include <functional>
@@ -821,28 +822,38 @@ void GlimROS::bbox_callback(
   // Look up transform from obstacle frame (odom) → lidar frame
   Eigen::Isometry3d T_odom_base_link = pose_kalman_filter->getPose();
   Eigen::Isometry3d T_base_odom = T_odom_base_link.inverse();
+  {
+    std::ostringstream oss;
+    oss << T_odom_base_link.matrix();
+    spdlog::debug("bbox_callback: T_odom_base_link = \n{}", oss.str());
+  }
   const std::string& src_frame = msg->header.frame_id;
 
   // Step 1 — static part: base_link → velodyne (cache on first successful lookup)
-  if (!T_velodyne_base_valid_) {
+  if (!T_velodyne_base_valid) {
     try {
       const auto tf = tf_buffer_->lookupTransform(lidar_frame_id_, "base_link", tf2::TimePointZero);
       T_velodyne_base_ = tf2::transformToEigen(tf);
-      T_velodyne_base_valid_ = true;
+      T_velodyne_base_valid = true;
     } catch (const tf2::TransformException& e) {
       RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 3000,
           "bbox_callback: static TF base_link → %s not yet available: %s", lidar_frame_id_.c_str(), e.what());
       return;
     }
   }
-  Eigen::Isometry3d T_odom_lidar = T_velodyne_base_ * T_base_odom;
+  {
+    std::ostringstream oss;
+    oss << T_velodyne_base_.matrix();
+    spdlog::debug("bbox_callback: T_velodyne_base_ = \n{}", oss.str());
+  }
+  Eigen::Isometry3d T_velodyne_odom = T_velodyne_base_* T_base_odom;
   std::vector<BoundingBox> bboxes;
   for (const auto& obs : msg->obstacles) {
     const Eigen::Vector3d p_odom(obs.pose.position.x, obs.pose.position.y, obs.pose.position.z);
     const Eigen::Quaterniond q_odom(obs.pose.orientation.w, obs.pose.orientation.x,
                                     obs.pose.orientation.y, obs.pose.orientation.z);
-    const Eigen::Vector3d    p_lidar = T_odom_lidar * p_odom;
-    const Eigen::Matrix3d    R_lidar = T_odom_lidar.rotation() * q_odom.toRotationMatrix();
+    const Eigen::Vector3d    p_lidar = T_velodyne_odom * p_odom;
+    const Eigen::Matrix3d    R_lidar = T_velodyne_odom.rotation() * q_odom.toRotationMatrix();
 
     bboxes.emplace_back(
         Eigen::Vector3d(obs.size.x, obs.size.y, obs.size.z),
