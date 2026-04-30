@@ -130,6 +130,7 @@ GlimROS::GlimROS(const rclcpp::NodeOptions& options) : Node("glim_ros", options)
   // ---------------------------------------------------------------------------
   pose_kalman_filter = std::make_shared<glim::PoseKalmanFilter>();
   last_imu_stamp_    = -1.0;
+  
 
   // ---------------------------------------------------------------------------
   // Dynamic rejection — BBOX mode
@@ -298,11 +299,11 @@ GlimROS::GlimROS(const rclcpp::NodeOptions& options) : Node("glim_ros", options)
   if(dynamic_rejection_type == "FILTERED") {
     points_sub = this->create_subscription<sensor_msgs::msg::PointCloud2>(
       points_filtered_topic, qos, std::bind(&GlimROS::points_callback, this, _1));
-    spdlog::info("subscribe to {} and {}", imu_topic, points_filtered_topic);
+    spdlog::debug("subscribe to {} and {}", imu_topic, points_filtered_topic);
   } else {
     points_sub = this->create_subscription<sensor_msgs::msg::PointCloud2>(
         points_topic, qos, std::bind(&GlimROS::points_callback, this, _1));
-    spdlog::info("subscribe to {} and {}", imu_topic, points_topic);
+    spdlog::debug("subscribe to {} and {}", imu_topic, points_topic);
   }
   
   filtered_pose_pub = this->create_publisher<geometry_msgs::msg::PoseStamped>(
@@ -424,12 +425,12 @@ void GlimROS::image_callback(const sensor_msgs::msg::Image::ConstSharedPtr msg) 
 // =============================================================================
 
 size_t GlimROS::points_callback(const sensor_msgs::msg::PointCloud2::ConstSharedPtr msg) {
-  spdlog::info("points callback");
+  spdlog::debug("points callback");
 
   if (!GlobalConfig::instance()->has_param("meta", "lidar_frame_id")) {
     GlobalConfig::instance()->override_param<std::string>("meta", "lidar_frame_id", msg->header.frame_id);
   }
-  spdlog::info("points: {}.{}", msg->header.stamp.sec, msg->header.stamp.nanosec);
+  spdlog::debug("points: {}.{}", msg->header.stamp.sec, msg->header.stamp.nanosec);
 
   auto raw_points = glim::extract_raw_points(*msg, intensity_field, ring_field);
   if (!raw_points) {
@@ -447,7 +448,7 @@ size_t GlimROS::points_callback(const sensor_msgs::msg::PointCloud2::ConstShared
   if (keep_raw_points) {
     preprocessed->raw_points = raw_points;
   }
-  spdlog::info("preprocessed: {} points", preprocessed->points.size());
+  spdlog::debug("preprocessed: {} points", preprocessed->points.size());
   // ---------------------------------------------------------------------------
   // BBOX mode
   // ---------------------------------------------------------------------------
@@ -634,7 +635,6 @@ size_t GlimROS::points_callback(const sensor_msgs::msg::PointCloud2::ConstShared
   // No dynamic rejection
   // ---------------------------------------------------------------------------
   } else {
-    spdlog::info("no dynamic rejection, feed preprocessed frame directly to odometry");
     odometry_estimation->insert_frame(preprocessed);
   }
   Eigen::Isometry3d new_pose = pose_kalman_filter->getPose();
