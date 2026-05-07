@@ -767,6 +767,9 @@ void GlimROS::publish_voxelmap(
     if (v.is_wall) {
       // Walls: yellow
       c.r = 1.0f; c.g = 1.0f; c.b = 0.0f;
+    } else if (v.is_ground) {
+      // Ground: green
+      c.r = 0.0f; c.g = 1.0f; c.b = 0.0f;
     } else if (v.is_dynamic) {
       // Dynamic: red
       c.r = 1.0f; c.g = 0.0f; c.b = 0.0f;
