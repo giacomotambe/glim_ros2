@@ -804,6 +804,9 @@ void GlimROS::publish_voxelmap(
     } else if (v.is_dynamic) {
       // Dynamic: red
       c.r = 1.0f; c.g = 0.0f; c.b = 0.0f;
+    } else if (v.is_outlier) {
+      // Outlier: gray
+      c.r = 0.5f; c.g = 0.5f; c.b = 0.5f;
     } else {
       // Static: blue
       c.r = 0.0f; c.g = 0.0f; c.b = 1.0f;
