@@ -164,6 +164,7 @@ private:
   rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr dynamic_cluster_bboxes_pub;
   rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr cluster_history_pub;
   rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr wall_bbox_pub_;
+  rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr floor_bbox_pub_;
   // Kalman-filtered pose
   rclcpp::Publisher<geometry_msgs::msg::PoseStamped>::SharedPtr filtered_pose_pub;
   rclcpp::Publisher<visualization_msgs::msg::Marker>::SharedPtr filtered_pose_marker_pub;

@@ -289,6 +289,8 @@ GlimROS::GlimROS(const rclcpp::NodeOptions& options) : Node("glim_ros", options)
         "~/wall_points", 10);
     wall_bbox_pub_ = this->create_publisher<visualization_msgs::msg::MarkerArray>(
         "~/wall_bboxes", 10);
+    floor_bbox_pub_ = this->create_publisher<visualization_msgs::msg::MarkerArray>(
+        "~/floor_bboxes", 10);
     dynamic_cluster_bboxes_pub = this->create_publisher<visualization_msgs::msg::MarkerArray>(
         "~/cluster_bboxes", 10);
     cluster_history_pub = this->create_publisher<visualization_msgs::msg::MarkerArray>(
@@ -496,10 +498,39 @@ size_t GlimROS::points_callback(const sensor_msgs::msg::PointCloud2::ConstShared
       dynamic_points_voxel_pub->publish(std::move(dyn_msg));
     }
 
-    // Drain wall results and publish wall point cloud
+    // Drain wall results and publish wall point cloud + floor bbox
     for (const auto& wf : dynamic_object_rejection->get_wall_results()) {
       if (wf.num_wall_voxels > 0) {
         publish_wall_voxelmap(msg->header, wf);
+      }
+
+      if (!wf.floor_bboxes.empty()) {
+        visualization_msgs::msg::MarkerArray floor_marker_array;
+        int id = 0;
+        for (const auto& bbox : wf.floor_bboxes) {
+          visualization_msgs::msg::Marker m;
+          m.header.frame_id = "velodyne";
+          m.header.stamp    = msg->header.stamp;
+          m.ns              = "floor_bbox";
+          m.id              = id++;
+          m.type            = visualization_msgs::msg::Marker::CUBE;
+          m.action          = visualization_msgs::msg::Marker::ADD;
+          m.lifetime        = rclcpp::Duration::from_seconds(0.5);
+          const Eigen::Quaterniond q(bbox.get_rotation());
+          m.pose.position.x    = bbox.get_center().x();
+          m.pose.position.y    = bbox.get_center().y();
+          m.pose.position.z    = bbox.get_center().z();
+          m.pose.orientation.w = q.w();
+          m.pose.orientation.x = q.x();
+          m.pose.orientation.y = q.y();
+          m.pose.orientation.z = q.z();
+          m.scale.x = bbox.get_size().x();
+          m.scale.y = bbox.get_size().y();
+          m.scale.z = bbox.get_size().z();
+          m.color.r = 0.2f; m.color.g = 0.8f; m.color.b = 0.2f; m.color.a = 0.35f;
+          floor_marker_array.markers.push_back(m);
+        }
+        floor_bbox_pub_->publish(floor_marker_array);
       }
     }
 
