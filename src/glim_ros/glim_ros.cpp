@@ -277,8 +277,6 @@ GlimROS::GlimROS(const rclcpp::NodeOptions& options) : Node("glim_ros", options)
         "~/dynamic_points_bbox", 10);
     bbox_markers_pub = this->create_publisher<visualization_msgs::msg::MarkerArray>(
         "~/bbox_markers", 10);
-    ellipsoid_markers_pub_ = this->create_publisher<visualization_msgs::msg::MarkerArray>(
-        "~/bbox_ellipsoids", 10);
   }
 
   if (dynamic_rejection_type == "VOXEL") {
@@ -299,7 +297,13 @@ GlimROS::GlimROS(const rclcpp::NodeOptions& options) : Node("glim_ros", options)
         "~/cluster_bboxes", 10);
     cluster_history_pub = this->create_publisher<visualization_msgs::msg::MarkerArray>(
         "~/cluster_history", 10);
+  }
 
+  // Ellipsoid markers are available in both BBOX and VOXEL modes.
+  if (dynamic_rejection_type == "BBOX" || dynamic_rejection_type == "VOXEL") {
+    inflate_params_ = glim::VelocityInflationParams::from_config();
+    ellipsoid_markers_pub_ = this->create_publisher<visualization_msgs::msg::MarkerArray>(
+        "~/bbox_ellipsoids", 10);
   }
 
   if(dynamic_rejection_type == "FILTERED") {
@@ -642,6 +646,18 @@ size_t GlimROS::points_callback(const sensor_msgs::msg::PointCloud2::ConstShared
       }
       dynamic_cluster_bboxes_pub->publish(bbox_array);
       spdlog::debug("[glim_ros] published {} cluster bboxes (current frame)", bboxes.size());
+
+      // Ellipsoid markers for confirmed-dynamic clusters only.
+      std::vector<glim::BoundingBox> dyn_bboxes;
+      dyn_bboxes.reserve(bboxes.size());
+      for (const auto& bbox : bboxes)
+        if (bbox.is_dynamic_bbox()) dyn_bboxes.push_back(bbox);
+      if (!dyn_bboxes.empty()) {
+        std_msgs::msg::Header cluster_header;
+        cluster_header.stamp    = this->now();
+        cluster_header.frame_id = lidar_frame_id_;
+        publish_ellipsoid_markers(cluster_header, dyn_bboxes);
+      }
     }
 
     // --- Historia dei cluster: un colore per età del frame ---
@@ -774,26 +790,22 @@ void GlimROS::publish_ellipsoid_markers(
     const std_msgs::msg::Header& header,
     const std::vector<BoundingBox>& bboxes)
 {
-  if (!dynamic_bbox_rejection || !ellipsoid_markers_pub_) return;
-
-  const double v_fwd_k  = dynamic_bbox_rejection->get_v_fwd_k();
-  const double v_rear_k = dynamic_bbox_rejection->get_v_rear_k();
-  const double v_lat_k  = dynamic_bbox_rejection->get_v_lat_k();
-  const double v_min    = dynamic_bbox_rejection->get_v_min();
+  if (!ellipsoid_markers_pub_) return;
 
   visualization_msgs::msg::MarkerArray arr;
   int id = 0;
 
   for (const auto& bbox : bboxes) {
-    const double speed_xy = bbox.get_speed_xy();
-    const double h_base   = std::max(bbox.get_size().x(), bbox.get_size().y()) * 0.5;
-    const double semi_fwd = h_base + speed_xy * v_fwd_k;
-    const double semi_lat = h_base + speed_xy * v_lat_k;
-    const double semi_z   = std::max(bbox.get_size().z() * 0.5, 1e-6);
+    const double speed_xy  = bbox.get_speed_xy();
+    const double eff_speed = std::min(speed_xy, inflate_params_.v_max_speed);
+    const double h_base    = std::max(bbox.get_size().x(), bbox.get_size().y()) * 0.5;
+    const double semi_fwd  = h_base + eff_speed * inflate_params_.v_fwd_k;
+    const double semi_lat  = h_base + eff_speed * inflate_params_.v_lat_k;
+    const double semi_z    = std::max(bbox.get_size().z() * 0.5, 1e-6) + eff_speed * inflate_params_.v_vert_k;
 
     // Quaternion that rotates X-axis to align with velocity heading
     Eigen::Quaterniond q = Eigen::Quaterniond::Identity();
-    if (speed_xy > v_min) {
+    if (speed_xy > inflate_params_.v_min) {
       const Eigen::Vector3d& vel = bbox.get_velocity();
       const double yaw = std::atan2(vel.y(), vel.x());
       q = Eigen::AngleAxisd(yaw, Eigen::Vector3d::UnitZ());
@@ -826,7 +838,7 @@ void GlimROS::publish_ellipsoid_markers(
     }
 
     // Velocity ARROW (yellow) — shows heading and speed
-    if (speed_xy > v_min) {
+    if (speed_xy > inflate_params_.v_min) {
       visualization_msgs::msg::Marker arrow;
       arrow.header       = header;
       arrow.header.stamp = this->now();

@@ -133,6 +133,7 @@ private:
   std::string intensity_field;
   std::string ring_field;
   std::string lidar_frame_id_;
+  VelocityInflationParams inflate_params_;
 
   std::shared_ptr<tf2_ros::Buffer>            tf_buffer_;
   std::shared_ptr<tf2_ros::TransformListener> tf_listener_;
