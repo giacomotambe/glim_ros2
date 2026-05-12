@@ -20,6 +20,7 @@
 #include <sensor_msgs/msg/imu.hpp>
 #include <sensor_msgs/msg/image.hpp>
 #include <sensor_msgs/msg/point_cloud2.hpp>
+#include <jo_msgs/msg/obstacle_array.hpp>
 #include <tf2_ros/buffer.h>
 #include <tf2_ros/transform_listener.h>
 #include <tf2_eigen/tf2_eigen.hpp>
@@ -138,6 +139,8 @@ GlimROS::GlimROS(const rclcpp::NodeOptions& options) : Node("glim_ros", options)
   if (dynamic_rejection_type == "BBOX") {
     spdlog::info("dynamic rejection: BBOX mode");
     dynamic_bbox_rejection = std::make_shared<glim::DynamicBBoxRejection>();
+    this->declare_parameter<int64_t>("bbox_min_track_age",       5);
+    this->declare_parameter<double> ("bbox_min_static_velocity", 0.1);
   }
 
   // ---------------------------------------------------------------------------
@@ -264,7 +267,7 @@ GlimROS::GlimROS(const rclcpp::NodeOptions& options) : Node("glim_ros", options)
 
   if (dynamic_rejection_type == "BBOX") {
     auto bbox_qos = get_qos_settings(config_ros, "glim_ros", "bbox_qos");
-    bbox_sub = this->create_subscription<visualization_msgs::msg::MarkerArray>(
+    bbox_sub = this->create_subscription<jo_msgs::msg::ObstacleArray>(
         bbox_topic, bbox_qos, std::bind(&GlimROS::bbox_callback, this, _1));
 
     spdlog::info("advertise ~/filtered_points_bbox, ~/dynamic_points_bbox and ~/bbox_markers");
@@ -274,6 +277,8 @@ GlimROS::GlimROS(const rclcpp::NodeOptions& options) : Node("glim_ros", options)
         "~/dynamic_points_bbox", 10);
     bbox_markers_pub = this->create_publisher<visualization_msgs::msg::MarkerArray>(
         "~/bbox_markers", 10);
+    ellipsoid_markers_pub_ = this->create_publisher<visualization_msgs::msg::MarkerArray>(
+        "~/bbox_ellipsoids", 10);
   }
 
   if (dynamic_rejection_type == "VOXEL") {
@@ -765,6 +770,88 @@ void GlimROS::publish_bounding_boxes(
   pub->publish(marker_array);
 }
 
+void GlimROS::publish_ellipsoid_markers(
+    const std_msgs::msg::Header& header,
+    const std::vector<BoundingBox>& bboxes)
+{
+  if (!dynamic_bbox_rejection || !ellipsoid_markers_pub_) return;
+
+  const double v_fwd_k  = dynamic_bbox_rejection->get_v_fwd_k();
+  const double v_rear_k = dynamic_bbox_rejection->get_v_rear_k();
+  const double v_lat_k  = dynamic_bbox_rejection->get_v_lat_k();
+  const double v_min    = dynamic_bbox_rejection->get_v_min();
+
+  visualization_msgs::msg::MarkerArray arr;
+  int id = 0;
+
+  for (const auto& bbox : bboxes) {
+    const double speed_xy = bbox.get_speed_xy();
+    const double h_base   = std::max(bbox.get_size().x(), bbox.get_size().y()) * 0.5;
+    const double semi_fwd = h_base + speed_xy * v_fwd_k;
+    const double semi_lat = h_base + speed_xy * v_lat_k;
+    const double semi_z   = std::max(bbox.get_size().z() * 0.5, 1e-6);
+
+    // Quaternion that rotates X-axis to align with velocity heading
+    Eigen::Quaterniond q = Eigen::Quaterniond::Identity();
+    if (speed_xy > v_min) {
+      const Eigen::Vector3d& vel = bbox.get_velocity();
+      const double yaw = std::atan2(vel.y(), vel.x());
+      q = Eigen::AngleAxisd(yaw, Eigen::Vector3d::UnitZ());
+    }
+
+    const Eigen::Vector3d& c = bbox.get_center();
+
+    // Ellipsoid SPHERE (orange, semi-transparent) — forward semi-axis along X
+    {
+      visualization_msgs::msg::Marker m;
+      m.header       = header;
+      m.header.stamp = this->now();
+      m.ns           = "bbox_ellipsoid";
+      m.id           = id++;
+      m.type         = visualization_msgs::msg::Marker::SPHERE;
+      m.action       = visualization_msgs::msg::Marker::ADD;
+      m.lifetime     = rclcpp::Duration::from_seconds(0.2);
+      m.pose.position.x    = c.x();
+      m.pose.position.y    = c.y();
+      m.pose.position.z    = c.z();
+      m.pose.orientation.w = q.w();
+      m.pose.orientation.x = q.x();
+      m.pose.orientation.y = q.y();
+      m.pose.orientation.z = q.z();
+      m.scale.x = 2.0 * semi_fwd;
+      m.scale.y = 2.0 * semi_lat;
+      m.scale.z = 2.0 * semi_z;
+      m.color.r = 1.0f; m.color.g = 0.5f; m.color.b = 0.0f; m.color.a = 0.30f;
+      arr.markers.push_back(m);
+    }
+
+    // Velocity ARROW (yellow) — shows heading and speed
+    if (speed_xy > v_min) {
+      visualization_msgs::msg::Marker arrow;
+      arrow.header       = header;
+      arrow.header.stamp = this->now();
+      arrow.ns           = "bbox_ellipsoid_vel";
+      arrow.id           = id++;
+      arrow.type         = visualization_msgs::msg::Marker::ARROW;
+      arrow.action       = visualization_msgs::msg::Marker::ADD;
+      arrow.lifetime     = rclcpp::Duration::from_seconds(0.2);
+      const Eigen::Vector3d& vel = bbox.get_velocity();
+      geometry_msgs::msg::Point tail, tip;
+      tail.x = c.x(); tail.y = c.y(); tail.z = c.z();
+      tip.x  = c.x() + vel.x(); tip.y = c.y() + vel.y(); tip.z = c.z() + vel.z();
+      arrow.points.push_back(tail);
+      arrow.points.push_back(tip);
+      arrow.scale.x = 0.08;  // shaft diameter
+      arrow.scale.y = 0.15;  // head diameter
+      arrow.scale.z = 0.20;  // head length
+      arrow.color.r = 1.0f; arrow.color.g = 1.0f; arrow.color.b = 0.0f; arrow.color.a = 0.9f;
+      arr.markers.push_back(arrow);
+    }
+  }
+
+  ellipsoid_markers_pub_->publish(arr);
+}
+
 void GlimROS::publish_voxelmap(
     const std_msgs::msg::Header&              header,
     const gtsam_points::DynamicVoxelMapCPU&   voxelmap)
@@ -862,16 +949,13 @@ void GlimROS::publish_wall_voxelmap(
 // =============================================================================
 
 void GlimROS::bbox_callback(
-    const visualization_msgs::msg::MarkerArray::ConstSharedPtr msg)
+    const jo_msgs::msg::ObstacleArray::ConstSharedPtr msg)
 {
   if (dynamic_rejection_type != "BBOX") {
     spdlog::debug("received bbox message but dynamic_rejection_type != BBOX");
     return;
   }
-  if (msg->markers.empty()) {
-    return;
-  }
-  spdlog::debug("bbox callback: received {} obstacles", msg->markers.size());
+  spdlog::info("bbox callback: received {} obstacles", msg->obstacles.size());
   // Look up transform from obstacle frame (odom) → lidar frame
   Eigen::Isometry3d T_odom_base_link = pose_kalman_filter->getPose();
   Eigen::Isometry3d T_base_odom = T_odom_base_link.inverse();
@@ -880,6 +964,7 @@ void GlimROS::bbox_callback(
     oss << T_odom_base_link.matrix();
     spdlog::debug("bbox_callback: T_odom_base_link = \n{}", oss.str());
   }
+  const std::string& src_frame = msg->header.frame_id;
 
   // Step 1 — static part: base_link → velodyne (cache on first successful lookup)
   if (!T_velodyne_base_valid) {
@@ -899,25 +984,59 @@ void GlimROS::bbox_callback(
     spdlog::debug("bbox_callback: T_velodyne_base_ = \n{}", oss.str());
   }
   Eigen::Isometry3d T_velodyne_odom = T_velodyne_base_ * T_base_odom;
+
+  const int64_t min_track_age  = this->get_parameter("bbox_min_track_age").as_int();
+  const double  min_static_vel = this->get_parameter("bbox_min_static_velocity").as_double();
+
+  using Obs = jo_msgs::msg::Obstacle;
+
   std::vector<BoundingBox> bboxes;
-  for (const auto& marker : msg->markers) {
-    const Eigen::Vector3d p_odom(marker.pose.position.x, marker.pose.position.y, marker.pose.position.z);
-    const Eigen::Quaterniond q_odom(marker.pose.orientation.w, marker.pose.orientation.x,
-                                    marker.pose.orientation.y, marker.pose.orientation.z);
+  for (const auto& obs : msg->obstacles) {
+    // Condition 1: classified dynamic
+    bool should_filter = (obs.status == Obs::STATUS_DYNAMIC);
+
+    // Condition 2: potentially dynamic with enough track history
+    if (!should_filter &&
+        obs.status == Obs::STATUS_POTENTIALLY_DYNAMIC &&
+        static_cast<int64_t>(obs.track_age) > min_track_age) {
+      should_filter = true;
+    }
+
+    // Condition 3: static label but still moving (age gate + velocity gate)
+    if (!should_filter &&
+        obs.status == Obs::STATUS_STATIC &&
+        static_cast<int64_t>(obs.track_age) > min_track_age) {
+      const double v = std::sqrt(
+          obs.twist.linear.x * obs.twist.linear.x +
+          obs.twist.linear.y * obs.twist.linear.y +
+          obs.twist.linear.z * obs.twist.linear.z);
+      if (v > min_static_vel) {
+        should_filter = true;
+      }
+    }
+
+    if (!should_filter) continue;
+
+    const Eigen::Vector3d p_odom(obs.pose.position.x, obs.pose.position.y, obs.pose.position.z);
+    const Eigen::Quaterniond q_odom(obs.pose.orientation.w, obs.pose.orientation.x,
+                                    obs.pose.orientation.y, obs.pose.orientation.z);
     const Eigen::Vector3d    p_lidar = T_velodyne_odom * p_odom;
     const Eigen::Matrix3d    R_lidar = T_velodyne_odom.rotation() * q_odom.toRotationMatrix();
 
     bboxes.emplace_back(
-        Eigen::Vector3d(marker.scale.x, marker.scale.y, marker.scale.z),
+        Eigen::Vector3d(obs.size.x, obs.size.y, obs.size.z),
         p_lidar,
         R_lidar);
+    const Eigen::Vector3d vel_odom(obs.twist.linear.x, obs.twist.linear.y, obs.twist.linear.z);
+    bboxes.back().set_velocity(T_velodyne_odom.rotation() * vel_odom);
     dynamic_bbox_rejection->insert_bounding_boxes(bboxes.back());
   }
 
   std_msgs::msg::Header lidar_header;
-  lidar_header.stamp    = msg->markers[0].header.stamp;
+  lidar_header.stamp    = msg->header.stamp;
   lidar_header.frame_id = lidar_frame_id_;
   publish_bounding_boxes(lidar_header, bboxes, "bbox_input", false, bbox_markers_pub);
+  publish_ellipsoid_markers(lidar_header, bboxes);
 }
 
 // =============================================================================
