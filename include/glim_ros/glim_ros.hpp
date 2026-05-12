@@ -1,9 +1,13 @@
 #pragma once
 
 #include <any>
+#include <atomic>
+#include <condition_variable>
 #include <deque>
 #include <mutex>
 #include <memory>
+#include <queue>
+#include <thread>
 #include <rclcpp/rclcpp.hpp>
 
 #include <sensor_msgs/msg/imu.hpp>
@@ -63,6 +67,36 @@ public:
   const std::vector<std::shared_ptr<GenericTopicSubscription>>& extension_subscriptions();
 
 private:
+  // ---------------------------------------------------------------------------
+  // Raw-cloud ellipsoid filter (BBOX mode only)
+  //
+  // points_callback (ROS executor thread) pushes {raw_cloud, bboxes} to the
+  // worker thread AFTER calling reject(), guaranteeing that the bboxes are
+  // the same ones GLIM just used — no race condition with bbox_callback.
+  // raw_bboxes_ is written by bbox_callback and read by points_callback; both
+  // run on the same executor thread so no mutex is needed for that variable.
+  // ---------------------------------------------------------------------------
+  void raw_cloud_filter_worker();
+  sensor_msgs::msg::PointCloud2 apply_ellipsoid_filter(
+      const sensor_msgs::msg::PointCloud2& cloud,
+      const std::vector<BoundingBox>& bboxes) const;
+
+  // Bboxes in lidar frame, kept in sync by bbox_callback (executor thread).
+  std::vector<BoundingBox> raw_bboxes_;
+
+  struct FilterJob {
+    sensor_msgs::msg::PointCloud2::ConstSharedPtr cloud;
+    std::vector<BoundingBox> bboxes;
+  };
+
+  std::mutex                  raw_queue_mutex_;
+  std::condition_variable     raw_queue_cv_;
+  std::queue<FilterJob>       raw_cloud_queue_;
+  std::thread                 raw_cloud_filter_thread_;
+  std::atomic<bool>           raw_filter_running_{false};
+
+  rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr raw_filtered_pub_;
+
   void publish_voxelmap(const std_msgs::msg::Header& header,
                         const gtsam_points::DynamicVoxelMapCPU& voxelmap);
 
@@ -157,14 +191,15 @@ private:
 
   // BBOX mode
   rclcpp::Subscription<jo_msgs::msg::ObstacleArray>::SharedPtr bbox_sub;
-  rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr filtered_points_bbox_pub;
-  rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr dynamic_points_bbox_pub;
   rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr bbox_markers_pub;
+
+
+  // VOXEL and BBOX modes
+  rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr     dynamic_points_pub;
   rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr ellipsoid_markers_pub_;
 
   // VOXEL mode
-  rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr     filtered_points_voxel_pub;
-  rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr     dynamic_points_voxel_pub;
+  
   rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr voxelmap_pub;
   rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr     wall_points_pub;
   rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr dynamic_cluster_bboxes_pub;

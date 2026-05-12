@@ -44,7 +44,6 @@ endif()
 ament_auto_add_library(glim_ros SHARED
   src/glim_ros/glim_ros.cpp
   src/glim_ros/ros_qos.cpp
-  src/glim_ros/lidar_dynamic_filter.cpp
   src/pointcloud2_msg.cpp
 )
 target_include_directories(glim_ros PUBLIC
@@ -91,13 +90,6 @@ target_link_libraries(publish_bbox
   glim_ros
 )
 
-### lidar_dynamic_filter ###
-ament_auto_add_executable(lidar_dynamic_filter
-  src/lidar_dynamic_filter_node.cpp
-)
-target_link_libraries(lidar_dynamic_filter
-  glim_ros
-)
 
 if(BUILD_WITH_VIEWER)
   ### offline_viewer ###
@@ -121,5 +113,7 @@ if(BUILD_WITH_VIEWER)
     Boost::program_options
   )
 endif()
+
+install(DIRECTORY launch DESTINATION share/${PROJECT_NAME}/)
 
 ament_auto_package()

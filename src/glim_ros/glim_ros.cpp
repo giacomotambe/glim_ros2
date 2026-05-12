@@ -2,6 +2,7 @@
 
 #define GLIM_ROS2
 
+#include <cstring>
 #include <deque>
 #include <sstream>
 #include <thread>
@@ -251,8 +252,6 @@ GlimROS::GlimROS(const rclcpp::NodeOptions& options) : Node("glim_ros", options)
   const std::string points_topic = config_ros.param<std::string>("glim_ros", "points_topic", "");
   const std::string image_topic  = config_ros.param<std::string>("glim_ros", "image_topic",  "");
   const std::string bbox_topic   = config_ros.param<std::string>("glim_ros", "bbox_topic",   "");
-  const std::string points_filtered_topic = config_ros.param<std::string>("glim_ros", "points_filtered_topic", "");
-
   rclcpp::SensorDataQoS default_imu_qos;
   default_imu_qos.get_rmw_qos_profile().depth = 1000;
   auto qos = get_qos_settings(config_ros, "glim_ros", "imu_qos", default_imu_qos);
@@ -270,21 +269,21 @@ GlimROS::GlimROS(const rclcpp::NodeOptions& options) : Node("glim_ros", options)
     bbox_sub = this->create_subscription<jo_msgs::msg::ObstacleArray>(
         bbox_topic, bbox_qos, std::bind(&GlimROS::bbox_callback, this, _1));
 
-    spdlog::info("advertise ~/filtered_points_bbox, ~/dynamic_points_bbox and ~/bbox_markers");
-    filtered_points_bbox_pub = this->create_publisher<sensor_msgs::msg::PointCloud2>(
-        "~/filtered_points_bbox", 10);
-    dynamic_points_bbox_pub = this->create_publisher<sensor_msgs::msg::PointCloud2>(
-        "~/dynamic_points_bbox", 10);
+    spdlog::info("advertise ~/velodyne_points_dynamic, ~/bbox_markers, /velodyne_points_filtered");
     bbox_markers_pub = this->create_publisher<visualization_msgs::msg::MarkerArray>(
         "~/bbox_markers", 10);
+
+    // Raw-cloud filter: points_callback pushes {cloud, bboxes} to this thread
+    // after reject() so the bboxes are guaranteed to be in sync with GLIM.
+    raw_filtered_pub_ = this->create_publisher<sensor_msgs::msg::PointCloud2>(
+        "/velodyne_points_filtered", 10);
+    raw_filter_running_ = true;
+    raw_cloud_filter_thread_ = std::thread(&GlimROS::raw_cloud_filter_worker, this);
   }
 
   if (dynamic_rejection_type == "VOXEL") {
-    spdlog::info("advertise ~/filtered_points_voxel, ~/dynamic_points_voxel, ~/voxelmap, ~/wall_points");
-    filtered_points_voxel_pub = this->create_publisher<sensor_msgs::msg::PointCloud2>(
-        "~/filtered_points_voxel", 10);
-    dynamic_points_voxel_pub = this->create_publisher<sensor_msgs::msg::PointCloud2>(
-        "~/dynamic_points_voxel", 10);
+    spdlog::info("advertise ~/velodyne_points_dynamic, ~/voxelmap, ~/wall_points");
+    
     voxelmap_pub = this->create_publisher<visualization_msgs::msg::MarkerArray>(
         "~/voxelmap", 10);
     wall_points_pub = this->create_publisher<sensor_msgs::msg::PointCloud2>(
@@ -304,17 +303,14 @@ GlimROS::GlimROS(const rclcpp::NodeOptions& options) : Node("glim_ros", options)
     inflate_params_ = glim::VelocityInflationParams::from_config();
     ellipsoid_markers_pub_ = this->create_publisher<visualization_msgs::msg::MarkerArray>(
         "~/bbox_ellipsoids", 10);
+
+    dynamic_points_pub = this->create_publisher<sensor_msgs::msg::PointCloud2>(
+        "~/velodyne_points_dynamic", 10);
   }
 
-  if(dynamic_rejection_type == "FILTERED") {
-    points_sub = this->create_subscription<sensor_msgs::msg::PointCloud2>(
-      points_filtered_topic, qos, std::bind(&GlimROS::points_callback, this, _1));
-    spdlog::debug("subscribe to {} and {}", imu_topic, points_filtered_topic);
-  } else {
-    points_sub = this->create_subscription<sensor_msgs::msg::PointCloud2>(
-        points_topic, qos, std::bind(&GlimROS::points_callback, this, _1));
-    spdlog::debug("subscribe to {} and {}", imu_topic, points_topic);
-  }
+  points_sub = this->create_subscription<sensor_msgs::msg::PointCloud2>(
+      points_topic, qos, std::bind(&GlimROS::points_callback, this, _1));
+  spdlog::debug("subscribe to {} and {}", imu_topic, points_topic);
   
   filtered_pose_pub = this->create_publisher<geometry_msgs::msg::PoseStamped>(
       "~/filtered_pose", 10);
@@ -346,6 +342,13 @@ GlimROS::GlimROS(const rclcpp::NodeOptions& options) : Node("glim_ros", options)
 
 GlimROS::~GlimROS() {
   spdlog::debug("GlimROS shutting down");
+
+  if (raw_filter_running_) {
+    raw_filter_running_ = false;
+    raw_queue_cv_.notify_all();
+    if (raw_cloud_filter_thread_.joinable()) raw_cloud_filter_thread_.join();
+  }
+
   extension_modules.clear();
 
   if (dump_on_unload) {
@@ -467,15 +470,22 @@ size_t GlimROS::points_callback(const sensor_msgs::msg::PointCloud2::ConstShared
     spdlog::debug("BBOX filtered: {} → {} points",
         preprocessed->points.size(), filtered->points.size());
 
-    auto filtered_msg = glim_ros_utils::create_pointcloud2_msg(msg->header, filtered);
-    filtered_points_bbox_pub->publish(std::move(filtered_msg));
-
     odometry_estimation->insert_frame(filtered);
+
+    // Push raw cloud + the bboxes just used by reject() to the filter thread.
+    // Doing this here (after reject) guarantees temporal alignment with GLIM.
+    if (raw_filter_running_ && !raw_bboxes_.empty()) {
+      std::lock_guard<std::mutex> lock(raw_queue_mutex_);
+      raw_cloud_queue_.push({msg, raw_bboxes_});
+      raw_queue_cv_.notify_one();
+    } else if (raw_filter_running_) {
+      raw_filtered_pub_->publish(*msg);
+    }
 
     auto dyn = dynamic_bbox_rejection->get_last_dynamic_frame();
     if (dyn && !dyn->points.empty()) {
       auto dyn_msg = glim_ros_utils::create_pointcloud2_msg(msg->header, dyn);
-      dynamic_points_bbox_pub->publish(std::move(dyn_msg));
+      dynamic_points_pub->publish(std::move(dyn_msg));
     }
 
   // ---------------------------------------------------------------------------
@@ -488,8 +498,6 @@ size_t GlimROS::points_callback(const sensor_msgs::msg::PointCloud2::ConstShared
 
     // Drain static frames and feed to odometry
     for (const auto& filtered : dynamic_object_rejection->get_results()) {
-      auto filtered_msg = glim_ros_utils::create_pointcloud2_msg(msg->header, filtered);
-      filtered_points_voxel_pub->publish(std::move(filtered_msg));
       odometry_estimation->insert_frame(filtered);
     }
 
@@ -503,7 +511,7 @@ size_t GlimROS::points_callback(const sensor_msgs::msg::PointCloud2::ConstShared
     for (const auto& dyn : dynamic_object_rejection->get_dynamic_results()) {
       if (!dyn || dyn->points.empty()) continue;
       auto dyn_msg = glim_ros_utils::create_pointcloud2_msg(msg->header, dyn);
-      dynamic_points_voxel_pub->publish(std::move(dyn_msg));
+      dynamic_points_pub->publish(std::move(dyn_msg));
     }
 
     // Drain wall results and publish wall point cloud + floor bbox
@@ -1044,11 +1052,14 @@ void GlimROS::bbox_callback(
     dynamic_bbox_rejection->insert_bounding_boxes(bboxes.back());
   }
 
+  // Keep raw_bboxes_ in sync — same executor thread as points_callback, no mutex needed.
+  raw_bboxes_ = dynamic_bbox_rejection->get_bounding_boxes();
+
   std_msgs::msg::Header lidar_header;
   lidar_header.stamp    = msg->header.stamp;
   lidar_header.frame_id = lidar_frame_id_;
-  publish_bounding_boxes(lidar_header, bboxes, "bbox_input", false, bbox_markers_pub);
-  publish_ellipsoid_markers(lidar_header, bboxes);
+  publish_bounding_boxes(lidar_header, raw_bboxes_, "bbox_input", false, bbox_markers_pub);
+  publish_ellipsoid_markers(lidar_header, raw_bboxes_);
 }
 
 // =============================================================================
@@ -1164,6 +1175,85 @@ void GlimROS::wait(bool auto_quit) {
 void GlimROS::save(const std::string& path) {
   if (global_mapping) global_mapping->save(path);
   for (auto& mod : extension_modules) mod->at_exit(path);
+}
+
+// =============================================================================
+// raw_cloud_filter_worker()
+// =============================================================================
+
+void GlimROS::raw_cloud_filter_worker()
+{
+  while (raw_filter_running_) {
+    FilterJob job;
+    {
+      std::unique_lock<std::mutex> lock(raw_queue_mutex_);
+      raw_queue_cv_.wait(lock, [this] {
+        return !raw_cloud_queue_.empty() || !raw_filter_running_;
+      });
+      if (!raw_filter_running_ && raw_cloud_queue_.empty()) break;
+      job = std::move(raw_cloud_queue_.front());
+      raw_cloud_queue_.pop();
+    }
+
+    raw_filtered_pub_->publish(apply_ellipsoid_filter(*job.cloud, job.bboxes));
+  }
+}
+
+// =============================================================================
+// apply_ellipsoid_filter()
+// Bboxes are already in lidar frame — no TF transform needed.
+// =============================================================================
+
+sensor_msgs::msg::PointCloud2 GlimROS::apply_ellipsoid_filter(
+    const sensor_msgs::msg::PointCloud2& cloud,
+    const std::vector<BoundingBox>& bboxes) const
+{
+  int x_off = -1, y_off = -1, z_off = -1;
+  for (const auto& f : cloud.fields) {
+    if      (f.name == "x") x_off = static_cast<int>(f.offset);
+    else if (f.name == "y") y_off = static_cast<int>(f.offset);
+    else if (f.name == "z") z_off = static_cast<int>(f.offset);
+  }
+  if (x_off < 0 || y_off < 0 || z_off < 0) return cloud;
+
+  const uint32_t step     = cloud.point_step;
+  const uint32_t n_points = cloud.width * cloud.height;
+  const uint8_t* raw      = cloud.data.data();
+
+  std::vector<uint8_t> kept;
+  kept.reserve(n_points * step);
+
+  for (uint32_t i = 0; i < n_points; ++i) {
+    const uint8_t* base = raw + i * step;
+
+    float px, py, pz;
+    std::memcpy(&px, base + x_off, sizeof(float));
+    std::memcpy(&py, base + y_off, sizeof(float));
+    std::memcpy(&pz, base + z_off, sizeof(float));
+
+    const Eigen::Vector4d p4(px, py, pz, 1.0);
+    bool inside = false;
+    for (const auto& bbox : bboxes) {
+      if (bbox.contains_inflated(p4, inflate_params_)) {
+        inside = true;
+        break;
+      }
+    }
+
+    if (!inside) kept.insert(kept.end(), base, base + step);
+  }
+
+  sensor_msgs::msg::PointCloud2 out;
+  out.header       = cloud.header;
+  out.height       = 1;
+  out.width        = static_cast<uint32_t>(kept.size() / step);
+  out.fields       = cloud.fields;
+  out.is_bigendian = cloud.is_bigendian;
+  out.point_step   = step;
+  out.row_step     = static_cast<uint32_t>(kept.size());
+  out.data         = std::move(kept);
+  out.is_dense     = false;
+  return out;
 }
 
 }  // namespace glim
