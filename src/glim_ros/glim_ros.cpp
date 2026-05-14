@@ -2,6 +2,8 @@
 
 #define GLIM_ROS2
 
+#include <algorithm>
+#include <cstdint>
 #include <cstring>
 #include <deque>
 #include <sstream>
@@ -156,6 +158,9 @@ GlimROS::GlimROS(const rclcpp::NodeOptions& options) : Node("glim_ros", options)
     this->declare_parameter<double>(
         "bbox_min_static_velocity",
         config_bbox.param<double>("param_bbox_rejection", "bbox_min_static_velocity", 0.1));
+    this->declare_parameter<int64_t>(
+        "bbox_rejection_obstacle_min_removed_points",
+        config_bbox.param<int>("param_bbox_rejection", "bbox_rejection_obstacle_min_removed_points", 3));
   }
 
   // ---------------------------------------------------------------------------
@@ -286,6 +291,8 @@ GlimROS::GlimROS(const rclcpp::NodeOptions& options) : Node("glim_ros", options)
     spdlog::info("advertise ~/velodyne_points_dynamic, ~/bbox_markers, /velodyne_points_filtered");
     bbox_markers_pub = this->create_publisher<visualization_msgs::msg::MarkerArray>(
         "~/bbox_markers", 10);
+    rejection_obstacles_pub_ = this->create_publisher<jo_msgs::msg::ObstacleArray>(
+        "~/rejection_obstacles", 10);
 
     // Raw-cloud filter: points_callback pushes {cloud, bboxes} to this thread
     // after reject() so the bboxes are guaranteed to be in sync with GLIM.
@@ -485,6 +492,10 @@ size_t GlimROS::points_callback(const sensor_msgs::msg::PointCloud2::ConstShared
         preprocessed->points.size(), filtered->points.size());
 
     odometry_estimation->insert_frame(filtered);
+
+    raw_bboxes_ = dynamic_bbox_rejection->get_bounding_boxes();
+    const auto removed_counts = dynamic_bbox_rejection->get_last_removed_counts();
+    publish_rejection_obstacles(*msg, raw_bboxes_, removed_counts);
 
     // Push raw cloud + the bboxes just used by reject() to the filter thread.
     // Doing this here (after reject) guarantees temporal alignment with GLIM.
@@ -903,6 +914,69 @@ void GlimROS::publish_ellipsoid_markers(
   ellipsoid_markers_pub_->publish(arr);
 }
 
+void GlimROS::publish_rejection_obstacles(
+    const sensor_msgs::msg::PointCloud2& cloud,
+    const std::vector<BoundingBox>& bboxes,
+    const std::vector<int>& removed_counts)
+{
+  if (!rejection_obstacles_pub_ || bboxes.empty() || removed_counts.empty()) {
+    return;
+  }
+
+  if (!T_velodyne_base_valid) {
+    return;
+  }
+
+  const int64_t min_removed =
+      this->get_parameter("bbox_rejection_obstacle_min_removed_points").as_int();
+
+  const Eigen::Isometry3d T_odom_base_link = pose_kalman_filter->getPose();
+  const Eigen::Isometry3d T_base_odom = T_odom_base_link.inverse();
+  const Eigen::Isometry3d T_velodyne_odom = T_velodyne_base_ * T_base_odom;
+  const Eigen::Isometry3d T_odom_velodyne = T_velodyne_odom.inverse();
+
+  jo_msgs::msg::ObstacleArray arr;
+  arr.header.stamp = cloud.header.stamp;
+  arr.header.frame_id = "odom";
+
+  uint32_t fallback_id = 1000000;
+  const size_t n = std::min(bboxes.size(), removed_counts.size());
+  for (size_t i = 0; i < n; ++i) {
+    if (removed_counts[i] < min_removed) {
+      continue;
+    }
+
+    const auto& bbox = bboxes[i];
+    const Eigen::Vector3d center_odom = T_odom_velodyne * bbox.get_center();
+    const Eigen::Vector3d velocity_odom = T_odom_velodyne.rotation() * bbox.get_velocity();
+
+    jo_msgs::msg::Obstacle obs;
+    obs.header = arr.header;
+    obs.track_id = bbox.get_track_id() >= 0
+        ? static_cast<uint32_t>(bbox.get_track_id())
+        : fallback_id++;
+    obs.track_age = 0;
+    obs.status = jo_msgs::msg::Obstacle::STATUS_DYNAMIC;
+
+    obs.pose.position.x = center_odom.x();
+    obs.pose.position.y = center_odom.y();
+    obs.pose.position.z = center_odom.z();
+    obs.pose.orientation.w = 1.0;
+
+    obs.size.x = bbox.get_size().x();
+    obs.size.y = bbox.get_size().y();
+    obs.size.z = bbox.get_size().z();
+
+    obs.twist.linear.x = velocity_odom.x();
+    obs.twist.linear.y = velocity_odom.y();
+    obs.twist.linear.z = velocity_odom.z();
+
+    arr.obstacles.push_back(obs);
+  }
+
+  rejection_obstacles_pub_->publish(arr);
+}
+
 void GlimROS::publish_voxelmap(
     const std_msgs::msg::Header&              header,
     const gtsam_points::DynamicVoxelMapCPU&   voxelmap)
@@ -1081,6 +1155,7 @@ void GlimROS::bbox_callback(
         Eigen::Vector3d(obs.size.x, obs.size.y, obs.size.z),
         p_lidar,
         R_lidar);
+    bboxes.back().set_track_id(static_cast<int>(obs.track_id));
     const Eigen::Vector3d vel_odom(obs.twist.linear.x, obs.twist.linear.y, obs.twist.linear.z);
     bboxes.back().set_velocity(T_velodyne_odom.rotation() * vel_odom);
     dynamic_bbox_rejection->insert_bounding_boxes(bboxes.back());

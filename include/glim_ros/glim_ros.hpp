@@ -115,6 +115,11 @@ private:
       const std_msgs::msg::Header& header,
       const std::vector<BoundingBox>& bboxes);
 
+  void publish_rejection_obstacles(
+      const sensor_msgs::msg::PointCloud2& cloud,
+      const std::vector<BoundingBox>& bboxes,
+      const std::vector<int>& removed_counts);
+
   // ---------------------------------------------------------------------------
   // Core modules
   // ---------------------------------------------------------------------------
@@ -192,6 +197,7 @@ private:
   // BBOX mode
   rclcpp::Subscription<jo_msgs::msg::ObstacleArray>::SharedPtr bbox_sub;
   rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr bbox_markers_pub;
+  rclcpp::Publisher<jo_msgs::msg::ObstacleArray>::SharedPtr rejection_obstacles_pub_;
 
 
   // VOXEL and BBOX modes
