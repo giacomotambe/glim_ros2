@@ -140,8 +140,22 @@ GlimROS::GlimROS(const rclcpp::NodeOptions& options) : Node("glim_ros", options)
   if (dynamic_rejection_type == "BBOX") {
     spdlog::info("dynamic rejection: BBOX mode");
     dynamic_bbox_rejection = std::make_shared<glim::DynamicBBoxRejection>();
-    this->declare_parameter<int64_t>("bbox_min_track_age",       5);
-    this->declare_parameter<double> ("bbox_min_static_velocity", 0.1);
+    glim::Config config_bbox(glim::GlobalConfig::get_config_path("config_bbox_rejection"));
+    const int64_t bbox_min_track_age_default =
+        config_bbox.param<int>("param_bbox_rejection", "bbox_min_track_age", 5);
+    this->declare_parameter<int64_t>("bbox_min_track_age", bbox_min_track_age_default);
+    this->declare_parameter<int64_t>(
+        "bbox_potentially_dynamic_min_track_age",
+        config_bbox.param<int>(
+            "param_bbox_rejection",
+            "bbox_potentially_dynamic_min_track_age",
+            static_cast<int>(bbox_min_track_age_default)));
+    this->declare_parameter<int64_t>(
+        "bbox_static_min_track_age",
+        config_bbox.param<int>("param_bbox_rejection", "bbox_static_min_track_age", 8));
+    this->declare_parameter<double>(
+        "bbox_min_static_velocity",
+        config_bbox.param<double>("param_bbox_rejection", "bbox_min_static_velocity", 0.1));
   }
 
   // ---------------------------------------------------------------------------
@@ -805,23 +819,40 @@ void GlimROS::publish_ellipsoid_markers(
 
   for (const auto& bbox : bboxes) {
     const double speed_xy  = bbox.get_speed_xy();
-    const double eff_speed = std::min(speed_xy, inflate_params_.v_max_speed);
-    const double h_base    = std::max(bbox.get_size().x(), bbox.get_size().y()) * 0.5;
-    const double semi_fwd  = h_base + eff_speed * inflate_params_.v_fwd_k;
-    const double semi_lat  = h_base + eff_speed * inflate_params_.v_lat_k;
-    const double semi_z    = std::max(bbox.get_size().z() * 0.5, 1e-6) + eff_speed * inflate_params_.v_vert_k;
+    const double eff_speed =
+      speed_xy > inflate_params_.v_min ? std::min(speed_xy, inflate_params_.v_max_speed) : 0.0;
+    const double hx        = bbox.get_size().x() * 0.5;
+    const double hy        = bbox.get_size().y() * 0.5;
+    const double hz        = std::max(bbox.get_size().z() * 0.5, 1e-6);
+    const double cover_scale = std::max(inflate_params_.ellipse_box_cover_scale, 1.0);
 
     // Quaternion that rotates X-axis to align with velocity heading
     Eigen::Quaterniond q = Eigen::Quaterniond::Identity();
+    Eigen::Vector3d heading = Eigen::Vector3d::UnitX();
     if (speed_xy > inflate_params_.v_min) {
       const Eigen::Vector3d& vel = bbox.get_velocity();
       const double yaw = std::atan2(vel.y(), vel.x());
       q = Eigen::AngleAxisd(yaw, Eigen::Vector3d::UnitZ());
+      heading = Eigen::Vector3d(std::cos(yaw), std::sin(yaw), 0.0);
     }
+    const Eigen::Vector3d lateral(-heading.y(), heading.x(), 0.0);
+    const Eigen::Vector3d box_x_axis = bbox.get_rotation().col(0);
+    const Eigen::Vector3d box_y_axis = bbox.get_rotation().col(1);
+    const double bbox_half_u =
+      std::abs(heading.dot(box_x_axis)) * hx +
+      std::abs(heading.dot(box_y_axis)) * hy;
+    const double bbox_half_v =
+      std::abs(lateral.dot(box_x_axis)) * hx +
+      std::abs(lateral.dot(box_y_axis)) * hy;
+    const double semi_u = cover_scale * bbox_half_u +
+      0.5 * eff_speed * (inflate_params_.v_fwd_k + inflate_params_.v_rear_k);
+    const double semi_lat = cover_scale * bbox_half_v + eff_speed * inflate_params_.v_lat_k;
 
     const Eigen::Vector3d& c = bbox.get_center();
+    const Eigen::Vector3d egg_center =
+      c + heading * (0.5 * eff_speed * (inflate_params_.v_fwd_k - inflate_params_.v_rear_k));
 
-    // Ellipsoid SPHERE (orange, semi-transparent) — forward semi-axis along X
+    // 2D velocity egg footprint, extruded only to the inflated bbox height.
     {
       visualization_msgs::msg::Marker m;
       m.header       = header;
@@ -831,16 +862,16 @@ void GlimROS::publish_ellipsoid_markers(
       m.type         = visualization_msgs::msg::Marker::SPHERE;
       m.action       = visualization_msgs::msg::Marker::ADD;
       m.lifetime     = rclcpp::Duration::from_seconds(0.2);
-      m.pose.position.x    = c.x();
-      m.pose.position.y    = c.y();
+      m.pose.position.x    = egg_center.x();
+      m.pose.position.y    = egg_center.y();
       m.pose.position.z    = c.z();
       m.pose.orientation.w = q.w();
       m.pose.orientation.x = q.x();
       m.pose.orientation.y = q.y();
       m.pose.orientation.z = q.z();
-      m.scale.x = 2.0 * semi_fwd;
+      m.scale.x = 2.0 * semi_u;
       m.scale.y = 2.0 * semi_lat;
-      m.scale.z = 2.0 * semi_z;
+      m.scale.z = 2.0 * hz;
       m.color.r = 1.0f; m.color.g = 0.5f; m.color.b = 0.0f; m.color.a = 0.30f;
       arr.markers.push_back(m);
     }
@@ -1005,8 +1036,11 @@ void GlimROS::bbox_callback(
   }
   Eigen::Isometry3d T_velodyne_odom = T_velodyne_base_ * T_base_odom;
 
-  const int64_t min_track_age  = this->get_parameter("bbox_min_track_age").as_int();
-  const double  min_static_vel = this->get_parameter("bbox_min_static_velocity").as_double();
+  const int64_t potentially_dynamic_min_track_age =
+      this->get_parameter("bbox_potentially_dynamic_min_track_age").as_int();
+  const int64_t static_min_track_age =
+      this->get_parameter("bbox_static_min_track_age").as_int();
+  const double min_static_vel = this->get_parameter("bbox_min_static_velocity").as_double();
 
   using Obs = jo_msgs::msg::Obstacle;
 
@@ -1018,14 +1052,14 @@ void GlimROS::bbox_callback(
     // Condition 2: potentially dynamic with enough track history
     if (!should_filter &&
         obs.status == Obs::STATUS_POTENTIALLY_DYNAMIC &&
-        static_cast<int64_t>(obs.track_age) > min_track_age) {
+        static_cast<int64_t>(obs.track_age) > potentially_dynamic_min_track_age) {
       should_filter = true;
     }
 
     // Condition 3: static label but still moving (age gate + velocity gate)
     if (!should_filter &&
         obs.status == Obs::STATUS_STATIC &&
-        static_cast<int64_t>(obs.track_age) > min_track_age) {
+        static_cast<int64_t>(obs.track_age) > static_min_track_age) {
       const double v = std::sqrt(
           obs.twist.linear.x * obs.twist.linear.x +
           obs.twist.linear.y * obs.twist.linear.y +
