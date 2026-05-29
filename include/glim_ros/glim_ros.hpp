@@ -205,6 +205,7 @@ private:
   rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr ellipsoid_markers_pub_;
 
   // VOXEL mode
+  rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr     static_points_pub;
   
   rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr voxelmap_pub;
   rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr     wall_points_pub;

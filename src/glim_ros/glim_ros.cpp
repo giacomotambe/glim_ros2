@@ -303,8 +303,8 @@ GlimROS::GlimROS(const rclcpp::NodeOptions& options) : Node("glim_ros", options)
   }
 
   if (dynamic_rejection_type == "VOXEL") {
-    spdlog::info("advertise ~/velodyne_points_dynamic, ~/voxelmap, ~/wall_points");
-    
+    spdlog::info("advertise ~/velodyne_points_dynamic, ~/velodyne_points_static, ~/voxelmap, ~/wall_points");
+
     voxelmap_pub = this->create_publisher<visualization_msgs::msg::MarkerArray>(
         "~/voxelmap", 10);
     wall_points_pub = this->create_publisher<sensor_msgs::msg::PointCloud2>(
@@ -317,6 +317,8 @@ GlimROS::GlimROS(const rclcpp::NodeOptions& options) : Node("glim_ros", options)
         "~/cluster_bboxes", 10);
     cluster_history_pub = this->create_publisher<visualization_msgs::msg::MarkerArray>(
         "~/cluster_history", 10);
+    static_points_pub = this->create_publisher<sensor_msgs::msg::PointCloud2>(
+        "~/velodyne_points_static", 10);
   }
 
   // Ellipsoid markers are available in both BBOX and VOXEL modes.
@@ -524,6 +526,10 @@ size_t GlimROS::points_callback(const sensor_msgs::msg::PointCloud2::ConstShared
     // Drain static frames and feed to odometry
     for (const auto& filtered : dynamic_object_rejection->get_results()) {
       odometry_estimation->insert_frame(filtered);
+      if (filtered && !filtered->points.empty()) {
+        auto static_msg = glim_ros_utils::create_pointcloud2_msg(msg->header, filtered);
+        static_points_pub->publish(std::move(static_msg));
+      }
     }
 
     // Publish latest voxelmap for visualization
