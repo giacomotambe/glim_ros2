@@ -10,6 +10,9 @@
 #include <thread>
 #include <iostream>
 #include <functional>
+#include <unordered_map>
+#include <unordered_set>
+#include <vector>
 #include <boost/format.hpp>
 #include <spdlog/spdlog.h>
 #include <spdlog/sinks/basic_file_sink.h>
@@ -498,6 +501,12 @@ size_t GlimROS::points_callback(const sensor_msgs::msg::PointCloud2::ConstShared
     raw_bboxes_ = dynamic_bbox_rejection->get_bounding_boxes();
     const auto removed_counts = dynamic_bbox_rejection->get_last_removed_counts();
     publish_rejection_obstacles(*msg, raw_bboxes_, removed_counts);
+    {
+      std_msgs::msg::Header ellipsoid_header;
+      ellipsoid_header.stamp = msg->header.stamp;
+      ellipsoid_header.frame_id = lidar_frame_id_;
+      publish_ellipsoid_markers(ellipsoid_header, raw_bboxes_);
+    }
 
     // Push raw cloud + the bboxes just used by reject() to the filter thread.
     // Doing this here (after reject) guarantees temporal alignment with GLIM.
@@ -512,6 +521,12 @@ size_t GlimROS::points_callback(const sensor_msgs::msg::PointCloud2::ConstShared
     auto dyn = dynamic_bbox_rejection->get_last_dynamic_frame();
     if (dyn && !dyn->points.empty()) {
       auto dyn_msg = glim_ros_utils::create_pointcloud2_msg(msg->header, dyn);
+      dynamic_points_pub->publish(std::move(dyn_msg));
+    } else if (dynamic_points_pub) {
+      auto empty_dyn = std::make_shared<PreprocessedFrame>();
+      empty_dyn->stamp = preprocessed->stamp;
+      empty_dyn->scan_end_time = preprocessed->scan_end_time;
+      auto dyn_msg = glim_ros_utils::create_pointcloud2_msg(msg->header, empty_dyn);
       dynamic_points_pub->publish(std::move(dyn_msg));
     }
 
@@ -780,6 +795,7 @@ void GlimROS::publish_bounding_boxes(
     rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr pub)
 {
   visualization_msgs::msg::MarkerArray marker_array;
+  static std::unordered_map<std::string, size_t> previous_counts;
 
   for (size_t i = 0; i < bboxes.size(); ++i) {
     const auto& bbox = bboxes[i];
@@ -791,7 +807,7 @@ void GlimROS::publish_bounding_boxes(
     m.id              = static_cast<int>(i);
     m.type            = visualization_msgs::msg::Marker::CUBE;
     m.action          = visualization_msgs::msg::Marker::ADD;
-    m.lifetime = rclcpp::Duration::from_seconds(0.2);
+    m.lifetime        = rclcpp::Duration::from_seconds(0.0);
 
     // Posizione
     const Eigen::Vector3d& c = bbox.get_center();
@@ -822,6 +838,18 @@ void GlimROS::publish_bounding_boxes(
     marker_array.markers.push_back(m);
   }
 
+  const size_t previous_count = previous_counts[ns];
+  for (size_t i = bboxes.size(); i < previous_count; ++i) {
+    visualization_msgs::msg::Marker m;
+    m.header.frame_id = header.frame_id;
+    m.header.stamp    = this->now();
+    m.ns              = ns;
+    m.id              = static_cast<int>(i);
+    m.action          = visualization_msgs::msg::Marker::DELETE;
+    marker_array.markers.push_back(m);
+  }
+  previous_counts[ns] = bboxes.size();
+
   pub->publish(marker_array);
 }
 
@@ -832,9 +860,14 @@ void GlimROS::publish_ellipsoid_markers(
   if (!ellipsoid_markers_pub_) return;
 
   visualization_msgs::msg::MarkerArray arr;
-  int id = 0;
+  static size_t previous_ellipsoid_count = 0;
+  static size_t previous_arrow_count = 0;
+  static std::unordered_map<int, Eigen::Vector3d> last_visible_velocity;
+  size_t ellipsoid_count = 0;
+  size_t arrow_count = 0;
 
-  for (const auto& bbox : bboxes) {
+  for (size_t i = 0; i < bboxes.size(); ++i) {
+    const auto& bbox = bboxes[i];
     const double speed_xy  = bbox.get_speed_xy();
     const double eff_speed =
       speed_xy > inflate_params_.v_min ? std::min(speed_xy, inflate_params_.v_max_speed) : 0.0;
@@ -875,10 +908,10 @@ void GlimROS::publish_ellipsoid_markers(
       m.header       = header;
       m.header.stamp = this->now();
       m.ns           = "bbox_ellipsoid";
-      m.id           = id++;
+      m.id           = static_cast<int>(ellipsoid_count++);
       m.type         = visualization_msgs::msg::Marker::SPHERE;
       m.action       = visualization_msgs::msg::Marker::ADD;
-      m.lifetime     = rclcpp::Duration::from_seconds(0.2);
+      m.lifetime     = rclcpp::Duration::from_seconds(0.0);
       m.pose.position.x    = egg_center.x();
       m.pose.position.y    = egg_center.y();
       m.pose.position.z    = c.z();
@@ -893,20 +926,37 @@ void GlimROS::publish_ellipsoid_markers(
       arr.markers.push_back(m);
     }
 
-    // Velocity ARROW (yellow) — shows heading and speed
-    if (speed_xy > inflate_params_.v_min) {
+    const int velocity_key = bbox.get_track_id() >= 0
+      ? bbox.get_track_id()
+      : static_cast<int>(i);
+    Eigen::Vector3d arrow_velocity = bbox.get_velocity();
+    double arrow_speed = std::hypot(arrow_velocity.x(), arrow_velocity.y());
+    if (arrow_speed > inflate_params_.v_min) {
+      last_visible_velocity[velocity_key] = arrow_velocity;
+    } else {
+      const auto it = last_visible_velocity.find(velocity_key);
+      if (it != last_visible_velocity.end()) {
+        arrow_velocity = it->second;
+        arrow_speed = std::hypot(arrow_velocity.x(), arrow_velocity.y());
+      }
+    }
+
+    // Velocity ARROW (yellow) — shows heading and speed. If the stream is paused
+    // after a zero-velocity update, keep the last visible arrow for screenshots.
+    if (arrow_speed > inflate_params_.v_min) {
       visualization_msgs::msg::Marker arrow;
       arrow.header       = header;
       arrow.header.stamp = this->now();
       arrow.ns           = "bbox_ellipsoid_vel";
-      arrow.id           = id++;
+      arrow.id           = static_cast<int>(arrow_count++);
       arrow.type         = visualization_msgs::msg::Marker::ARROW;
       arrow.action       = visualization_msgs::msg::Marker::ADD;
-      arrow.lifetime     = rclcpp::Duration::from_seconds(0.2);
-      const Eigen::Vector3d& vel = bbox.get_velocity();
+      arrow.lifetime     = rclcpp::Duration::from_seconds(0.0);
       geometry_msgs::msg::Point tail, tip;
       tail.x = c.x(); tail.y = c.y(); tail.z = c.z();
-      tip.x  = c.x() + vel.x(); tip.y = c.y() + vel.y(); tip.z = c.z() + vel.z();
+      tip.x  = c.x() + arrow_velocity.x();
+      tip.y  = c.y() + arrow_velocity.y();
+      tip.z  = c.z() + arrow_velocity.z();
       arrow.points.push_back(tail);
       arrow.points.push_back(tip);
       arrow.scale.x = 0.08;  // shaft diameter
@@ -916,6 +966,27 @@ void GlimROS::publish_ellipsoid_markers(
       arr.markers.push_back(arrow);
     }
   }
+
+  for (size_t i = ellipsoid_count; i < previous_ellipsoid_count; ++i) {
+    visualization_msgs::msg::Marker m;
+    m.header       = header;
+    m.header.stamp = this->now();
+    m.ns           = "bbox_ellipsoid";
+    m.id           = static_cast<int>(i);
+    m.action       = visualization_msgs::msg::Marker::DELETE;
+    arr.markers.push_back(m);
+  }
+  for (size_t i = arrow_count; i < previous_arrow_count; ++i) {
+    visualization_msgs::msg::Marker m;
+    m.header       = header;
+    m.header.stamp = this->now();
+    m.ns           = "bbox_ellipsoid_vel";
+    m.id           = static_cast<int>(i);
+    m.action       = visualization_msgs::msg::Marker::DELETE;
+    arr.markers.push_back(m);
+  }
+  previous_ellipsoid_count = ellipsoid_count;
+  previous_arrow_count = arrow_count;
 
   ellipsoid_markers_pub_->publish(arr);
 }
@@ -1118,38 +1189,38 @@ void GlimROS::bbox_callback(
 
   const int64_t potentially_dynamic_min_track_age =
       this->get_parameter("bbox_potentially_dynamic_min_track_age").as_int();
-  const int64_t static_min_track_age =
-      this->get_parameter("bbox_static_min_track_age").as_int();
-  const double min_static_vel = this->get_parameter("bbox_min_static_velocity").as_double();
 
   using Obs = jo_msgs::msg::Obstacle;
 
+  auto is_rejection_obstacle = [&](const Obs& obs) {
+    if (obs.status == Obs::STATUS_DYNAMIC) {
+      return true;
+    }
+
+    return obs.status == Obs::STATUS_POTENTIALLY_DYNAMIC &&
+           static_cast<int64_t>(obs.track_age) > potentially_dynamic_min_track_age;
+  };
+
+  std::unordered_set<int> eligible_track_ids;
+  std::unordered_set<int> blocked_track_ids;
+  for (const auto& obs : msg->obstacles) {
+    const int track_id = static_cast<int>(obs.track_id);
+    if (is_rejection_obstacle(obs)) {
+      eligible_track_ids.insert(track_id);
+    } else {
+      blocked_track_ids.insert(track_id);
+    }
+  }
+  for (const int track_id : eligible_track_ids) {
+    blocked_track_ids.erase(track_id);
+  }
+  dynamic_bbox_rejection->remove_bounding_boxes_by_track_ids(blocked_track_ids);
+
   std::vector<BoundingBox> bboxes;
   for (const auto& obs : msg->obstacles) {
-    // Condition 1: classified dynamic
-    bool should_filter = (obs.status == Obs::STATUS_DYNAMIC);
-
-    // Condition 2: potentially dynamic with enough track history
-    if (!should_filter &&
-        obs.status == Obs::STATUS_POTENTIALLY_DYNAMIC &&
-        static_cast<int64_t>(obs.track_age) > potentially_dynamic_min_track_age) {
-      should_filter = true;
-    }
-
-    // Condition 3: static label but still moving (age gate + velocity gate)
-    if (!should_filter &&
-        obs.status == Obs::STATUS_STATIC &&
-        static_cast<int64_t>(obs.track_age) > static_min_track_age) {
-      const double v = std::sqrt(
-          obs.twist.linear.x * obs.twist.linear.x +
-          obs.twist.linear.y * obs.twist.linear.y +
-          obs.twist.linear.z * obs.twist.linear.z);
-      if (v > min_static_vel) {
-        should_filter = true;
-      }
-    }
-
-    if (!should_filter) continue;
+    // Static/tracked obstacles are NOT removed from the lidar scan.
+    // Only DYNAMIC and POTENTIALLY_DYNAMIC bboxes drive point rejection.
+    if (!is_rejection_obstacle(obs)) continue;
 
     const Eigen::Vector3d p_odom(obs.pose.position.x, obs.pose.position.y, obs.pose.position.z);
     const Eigen::Quaterniond q_odom(obs.pose.orientation.w, obs.pose.orientation.x,
@@ -1173,7 +1244,7 @@ void GlimROS::bbox_callback(
   std_msgs::msg::Header lidar_header;
   lidar_header.stamp    = msg->header.stamp;
   lidar_header.frame_id = lidar_frame_id_;
-  publish_bounding_boxes(lidar_header, raw_bboxes_, "bbox_input", false, bbox_markers_pub);
+  publish_bounding_boxes(lidar_header, bboxes, "bbox_input", false, bbox_markers_pub);
   publish_ellipsoid_markers(lidar_header, raw_bboxes_);
 }
 
